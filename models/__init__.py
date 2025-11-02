@@ -4,6 +4,7 @@ from models.event import OutboxEvent, EventType, AggregateType
 from models.search import SearchResult, SearchWeights
 from models.embeddings import Embeddings
 from models.sync import SyncResult
+from models.pagination import PaginationInfo
 
 __all__ = [
     "Job",
@@ -15,5 +16,6 @@ __all__ = [
     "SearchWeights",
     "Embeddings",
     "SyncResult",
+    "PaginationInfo",
 ]
 

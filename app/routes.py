@@ -30,14 +30,17 @@ def create_routes(app: Flask, search_service: SearchService):
         weights = SearchWeights.from_dict(data.get("weights", {"dense": 1.0, "sparse": 1.0}))
 
         try:
-            results = search_service.search(
+            results, pagination = search_service.search(
                 query=query,
                 limit=limit,
                 offset=offset,
                 dense_weight=weights.dense,
                 sparse_weight=weights.sparse,
             )
-            return jsonify({"results": results}), 200
+            return jsonify({
+                "results": results,
+                "pagination": pagination.to_dict()
+            }), 200
         except Exception as e:
             logger.exception("Search failed")
             return jsonify({"error": str(e)}), 500
