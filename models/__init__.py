@@ -1,7 +1,7 @@
 """Data models for the search service"""
 from models.job import Job, JobSkill
 from models.event import OutboxEvent, EventType, AggregateType
-from models.search import SearchResult, SearchWeights
+from models.search import SearchWeights
 from models.embeddings import Embeddings
 from models.sync import SyncResult
 from models.pagination import PaginationInfo
@@ -12,7 +12,6 @@ __all__ = [
     "OutboxEvent",
     "EventType",
     "AggregateType",
-    "SearchResult",
     "SearchWeights",
     "Embeddings",
     "SyncResult",

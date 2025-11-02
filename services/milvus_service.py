@@ -211,23 +211,8 @@ class MilvusService:
         )
         rerank = WeightedRanker(sparse_weight, dense_weight)
 
-        output_fields = [
-            "id",
-            "title",
-            "company",
-            "job_role",
-            "seniority",
-            "min_experience_years",
-            "work_mode",
-            "salary_min",
-            "salary_max",
-            "currency",
-            "status",
-            "date_posted",
-            "date_expires",
-            "skills",
-            "location",
-        ]
+        # Only need id field for search results
+        output_fields = ["id"]
 
         return self.jobs_collection.hybrid_search(
             [sparse_req, dense_req],

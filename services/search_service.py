@@ -4,7 +4,7 @@ import time
 from typing import List, Tuple
 from services.milvus_service import MilvusService
 from app.config import Config
-from models.search import SearchResult, SearchWeights
+from models.search import SearchWeights
 from models.embeddings import Embeddings
 from models.pagination import PaginationInfo
 
@@ -24,11 +24,11 @@ class SearchService:
         offset: int = 0,
         dense_weight: float = 1.0,
         sparse_weight: float = 1.0,
-    ) -> Tuple[List[dict], PaginationInfo]:
+    ) -> Tuple[List[int], PaginationInfo]:
         """Perform hybrid search for jobs
         
         Returns:
-            Tuple of (results, pagination_info)
+            Tuple of (job_ids, pagination_info)
         """
         start = time.time()
 
@@ -55,34 +55,33 @@ class SearchService:
             f"Search completed in {time.time() - start:.2f}s, found {len(results)} results"
         )
 
-        formatted_results = []
+        job_ids = []
         
-        # Filter results by threshold
+        # Filter results by threshold and extract only IDs
         for hit in results:
-            # Debug: log raw hit data
-            logger.debug(f"Raw hit data - id={hit.get('id')}, skills={hit.get('skills')}, skills_type={type(hit.get('skills'))}")
-            
-            search_result = SearchResult.from_milvus_hit(hit)
-            if search_result.score < Config.SEARCH_SCORE_THRESHOLD:
+            score = float(hit.score)
+            if score < Config.SEARCH_SCORE_THRESHOLD:
                 continue
-            formatted_results.append(search_result.to_dict())
+            
+            job_id = int(hit.get("id"))
+            if job_id:
+                job_ids.append(job_id)
 
         # Determine has_next: if we got limit+1 results, there might be more
-        # But we need to account for threshold filtering
-        has_next = len(formatted_results) > limit
+        has_next = len(job_ids) > limit
         
         # Return only up to limit results
         if has_next:
-            formatted_results = formatted_results[:limit]
+            job_ids = job_ids[:limit]
 
         # Build pagination info
         pagination = PaginationInfo(
             limit=limit,
             offset=offset,
-            count=len(formatted_results),
+            count=len(job_ids),
             has_next=has_next,
             has_prev=offset > 0,
         )
 
-        return formatted_results, pagination
+        return job_ids, pagination
 
