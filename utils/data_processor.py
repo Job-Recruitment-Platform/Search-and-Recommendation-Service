@@ -16,63 +16,44 @@ class DataProcessor:
         return " ".join(text.strip().split())
 
     @staticmethod
-    def extract_skill_names(skills: Any) -> List[str]:
+    def extract_skill_names(skills: Any) -> str:
         """
-        Extract skill names from skills array.
+        Extract skill names from skills array and return as comma-separated string.
         Handles both formats:
-        - Array of strings: ["Python", "Java"]
-        - Array of objects: [{"id": 1, "name": "Python"}, {"id": 2, "name": "Java"}]
+        - Array of strings: ["Python", "Java"] -> "Python, Java"
+        - Array of objects: [{"id": 1, "name": "Python"}, {"id": 2, "name": "Java"}] -> "Python, Java"
+        Returns VARCHAR-compatible string for Milvus
         """
         if not skills or not isinstance(skills, list):
-            return []
+            return ""
         
-        # Check if first item is a dict (object) or string
-        if isinstance(skills[0], dict):
+        skill_names = []
+        
+        if len(skills) > 0 and isinstance(skills[0], dict):
             # Array of objects: extract "name" field
-            skill_names = []
             for skill in skills:
                 if isinstance(skill, dict):
-                    name = skill.get("name")  # Get "name" field from skill object
+                    name = skill.get("name")
                     if name:
                         skill_names.append(str(name))
-            return skill_names
         else:
-            # Array of strings: return as is
-            return [str(skill) for skill in skills if skill]
+            # Array of strings: convert to list
+            skill_names = [str(skill) for skill in skills if skill]
+        
+        # Join with comma and space, return as VARCHAR string
+        return ", ".join(skill_names)
 
     @staticmethod
-    def _sparse_to_dict(sparse_vec: Any) -> Dict[int, float]:
-        """Convert a sparse vector to {index: value} dict acceptable by Milvus."""
-        try:
-            if isinstance(sparse_vec, dict):
-                return {int(k): float(v) for k, v in sparse_vec.items()}
-            if hasattr(sparse_vec, 'tocoo'):
-                coo = sparse_vec.tocoo()
-                return {int(i): float(v) for i, v in zip(coo.col, coo.data)}
-            if hasattr(sparse_vec, '__iter__') and not isinstance(sparse_vec, str):
-                out: Dict[int, float] = {}
-                for i, v in enumerate(sparse_vec):
-                    try:
-                        fv = float(v)
-                    except Exception:
-                        continue
-                    if fv != 0.0:
-                        out[i] = fv
-                return out
-        except Exception:
-            return {}
-        return {}
-
-    @staticmethod
-    def build_entity(dense_vec: List[float], sparse_vec: Any, job: Dict) -> Dict:
+    def build_entity(dense_vec: List[float], sparse_vec: dict, job: Dict) -> Dict:
         """Build a structured entity from raw job data"""
         try:
             job_id = job.get("id")
+            
             title = DataProcessor.clean_text(job.get("title", ""))
             skills = DataProcessor.extract_skill_names(job.get("skills", []))
-            company = DataProcessor.clean_text(job.get("company", ""))
             location = DataProcessor.clean_text(job.get("location", ""))
             
+            company = DataProcessor.clean_text(job.get("company", ""))
             job_role = DataProcessor.clean_text(job.get("job_role", ""))
             seniority = DataProcessor.clean_text(job.get("seniority", ""))
             min_experience_years = job.get("min_experience_years", 0)
@@ -86,15 +67,12 @@ class DataProcessor:
             date_posted = job.get("date_posted", 0)
             date_expires = job.get("date_expires", 0)
             
-            
-            
-            
             entity = {
                 "id": job_id,
                 "title": title,
                 "skills": skills,
-                "company": company,
                 "location": location,
+                "company": company,
                 "job_role": job_role,
                 "seniority": seniority,
                 "min_experience_years": min_experience_years,
@@ -107,7 +85,7 @@ class DataProcessor:
                 "date_posted": date_posted,
                 "date_expires": date_expires,
                 "dense_vector": dense_vec,
-                "sparse_vector": DataProcessor._sparse_to_dict(sparse_vec) if sparse_vec is not None else {},
+                "sparse_vector": sparse_vec,
             }
             return entity
         except Exception as e:
@@ -115,25 +93,33 @@ class DataProcessor:
             return {}
 
     @staticmethod
-    def build_entities(dense_vecs: List[List[float]], sparse_vecs: Any, jobs: List[Dict]) -> List[Dict]:
-        """Build structured entities from raw job data.
-        sparse_vecs can be a list, a single sparse object, or None.
-        """
+    def build_entities(
+        dense_vecs: List[List[float]],
+        sparse_vecs,
+        jobs: List[Dict]
+    ) -> List[Dict]:
+        """Build structured entities from raw job data."""
         entities: List[Dict] = []
-        count = min(len(dense_vecs), len(jobs))
-        is_list = isinstance(sparse_vecs, list)
+
+        # Normalize scipy sparse matrix to list of {index: value} using COO triplets
+        if hasattr(sparse_vecs, "shape"):
+            coo = sparse_vecs.tocoo()
+            rows = int(coo.shape[0])
+            row_dicts = [{} for _ in range(rows)]
+            for r, c, v in zip(coo.row, coo.col, coo.data):
+                row_dicts[int(r)][int(c)] = float(v)
+            sparse_vecs = row_dicts
+
+        count =  len(jobs)
         for idx in range(count):
-            if is_list:
-                sv = sparse_vecs[idx] if idx < len(sparse_vecs) else None
-            else:
-                sv = sparse_vecs if sparse_vecs is not None and idx == 0 else None
             entity = DataProcessor.build_entity(
                 dense_vec=dense_vecs[idx],
-                sparse_vec=sv,
+                sparse_vec=sparse_vecs[idx],
                 job=jobs[idx],
             )
             if entity:
                 entities.append(entity)
+
         return entities
     
     @staticmethod
@@ -141,8 +127,7 @@ class DataProcessor:
         """Combine relevant job fields into a single text string for embedding generation"""
         title = DataProcessor.clean_text(job.get("title", ""))
         skills = " ".join(DataProcessor.extract_skill_names(job.get("skills", [])))
-        company = DataProcessor.clean_text(job.get("company", ""))
         location = DataProcessor.clean_text(job.get("location", ""))
-        
-        combined_text = f"{title} {skills} {company} {location}"
+
+        combined_text = f"{title} {skills} {location}"
         return combined_text

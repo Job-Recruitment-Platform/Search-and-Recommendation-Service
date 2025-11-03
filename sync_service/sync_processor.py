@@ -19,14 +19,8 @@ class SyncProcessor:
 
     def sync_to_milvus(self, payload: Dict[str, Any]) -> SyncResult:
         """Sync job to Milvus (for CREATED/UPDATED events). Returns a SyncResult."""
-        # Normalize payload -> list of job dicts
-        if isinstance(payload, dict) and "id" in payload:
-            jobs_data = [payload]
-        elif isinstance(payload, list):
-            jobs_data = payload
-        else:
-            logger.error(f"Invalid payload format: {type(payload)}")
-            return SyncResult(processed=0, inserted=0, deleted=0, error="invalid_payload")
+        
+        jobs_data = [payload]
 
         try:
             jobs = [Job.from_dict(job_data) for job_data in jobs_data]
@@ -36,8 +30,8 @@ class SyncProcessor:
             embeddings = self.milvus_service.generate_embeddings(combined_texts)
 
             entities = DataProcessor.build_entities(
-                dense_vecs=embeddings.get("dense", []),
-                sparse_vecs=embeddings.get("sparse", []),
+                dense_vecs=embeddings.get("dense"),
+                sparse_vecs=embeddings.get("sparse"),
                 jobs=jobs_dict,
             )
 

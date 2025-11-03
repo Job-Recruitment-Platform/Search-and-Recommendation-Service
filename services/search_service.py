@@ -7,6 +7,7 @@ from app.config import Config
 from models.search import SearchWeights
 from models.embeddings import Embeddings
 from models.pagination import PaginationInfo
+from pymilvus import AnnSearchRequest, WeightedRanker
 
 logger = logging.getLogger(__name__)
 
@@ -22,58 +23,48 @@ class SearchService:
         query: str,
         limit: int = 10,
         offset: int = 0,
-        dense_weight: float = 1.0,
-        sparse_weight: float = 1.0,
     ) -> Tuple[List[int], PaginationInfo]:
         """Perform hybrid search for jobs
-        
         Returns:
             Tuple of (job_ids, pagination_info)
         """
-        start = time.time()
 
-        try:
-            embeddings_dict = self.milvus_service.generate_embeddings([query])
-            embeddings = Embeddings.from_dict(embeddings_dict)
-            logger.info(f"Generated embeddings in {time.time() - start:.2f}s")
-        except Exception as e:
-            logger.error(f"Embedding generation failed: {e}")
-            raise
+        query_embedding = self.milvus_service.generate_embeddings([query])
+        dense_vec = query_embedding.get("dense")[0]
+        sparse_vec = query_embedding.get("sparse")[0]
 
-        # Request more results to check if there are more pages
-        # We'll request limit + 1 to determine has_next
-        results = self.milvus_service.hybrid_search(
-            embeddings.get_dense_vector(0),
-            embeddings.get_sparse_vector(0),
-            dense_weight=dense_weight,
-            sparse_weight=sparse_weight,
-            limit=limit + 1,  # Request one extra to check has_next
+        # Normalize sparse row to dict {index: value} if needed
+        if hasattr(sparse_vec, "tocoo"):
+            coo = sparse_vec.tocoo()
+            sparse_vec = {int(j): float(v) for j, v in zip(coo.col, coo.data)}
+
+        dense_req = AnnSearchRequest(
+            data=[dense_vec],
+            anns_field="dense_vector",
+            param={"metric_type": "COSINE"},
+            limit=limit
+        )
+        
+        sparse_req = AnnSearchRequest(
+            data=[sparse_vec],
+            anns_field="sparse_vector",
+            param={"metric_type": "IP"},
+            limit=limit
+        )
+
+        results = self.milvus_service.jobs_collection.hybrid_search(
+            reqs=[dense_req, sparse_req],
+            rerank=WeightedRanker(float(0.5), float(0.5)),
             offset=offset,
+            limit=limit,
+            output_fields=["id"],
         )
-
-        logger.info(
-            f"Search completed in {time.time() - start:.2f}s, found {len(results)} results"
-        )
-
         job_ids = []
-        
-        # Filter results by threshold and extract only IDs
-        for hit in results:
-            score = float(hit.score)
-            if score < Config.SEARCH_SCORE_THRESHOLD:
-                continue
-            
-            job_id = int(hit.get("id"))
-            if job_id:
-                job_ids.append(job_id)
-
-        # Determine has_next: if we got limit+1 results, there might be more
-        has_next = len(job_ids) > limit
-        
-        # Return only up to limit results
-        if has_next:
-            job_ids = job_ids[:limit]
-
+        has_next = len(results) > limit
+        for hits in results:
+            for hit in hits:
+                job_ids.append(hit.entity.get("id"))
+                logger.info(f"Hit: id={hit.entity.get('id')}, score={hit.score}")
         # Build pagination info
         pagination = PaginationInfo(
             limit=limit,

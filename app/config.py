@@ -28,7 +28,6 @@ class Config:
     EMBEDDING_USE_FP16: bool = os.getenv("EMBEDDING_USE_FP16", "false").lower() == "true"
     
     # Search configuration
-    SEARCH_SCORE_THRESHOLD: float = float(os.getenv("SEARCH_SCORE_THRESHOLD", "0.8"))
     SEARCH_DEFAULT_LIMIT: int = int(os.getenv("SEARCH_DEFAULT_LIMIT", "10"))
     SEARCH_DEFAULT_OFFSET: int = int(os.getenv("SEARCH_DEFAULT_OFFSET", "0"))
 

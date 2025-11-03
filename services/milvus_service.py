@@ -24,6 +24,7 @@ class MilvusService:
 
     def __init__(self):
         self.jobs_collection = None
+        self.user_collection = None
         self.ef = None
         self.dense_dim = 0
         self._setup()
@@ -57,17 +58,17 @@ class MilvusService:
     def _setup_jobs_collection(self):
         """Initialize Milvus collection for jobs"""
         collection_name = "jobs"
-        
         if not utility.has_collection(collection_name):
+
             fields = [
                 FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
 
-                FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=100, enable_analyzer=True),
-                FieldSchema(name="skills", dtype=DataType.ARRAY, element_type=DataType.VARCHAR, max_length=100, max_capacity=30),
-                FieldSchema(name="company", dtype=DataType.VARCHAR, max_length=100, enable_analyzer=True),
-                FieldSchema(name="location", dtype=DataType.VARCHAR, max_length=100, enable_analyzer=True),
+                FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="skills", dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="location", dtype=DataType.VARCHAR, max_length=100),
 
                 # Filterable fields
+                FieldSchema(name="company", dtype=DataType.VARCHAR, max_length=100),  # e.g., "Acme Corp"
                 FieldSchema(name="job_role", dtype=DataType.VARCHAR, max_length=100), # e.g., "Software Engineer"
                 FieldSchema(name="seniority", dtype=DataType.VARCHAR, max_length=50), # e.g., "Junior", "Mid", "Senior", etc...
                 FieldSchema(name="min_experience_years", dtype=DataType.INT32),
@@ -81,16 +82,17 @@ class MilvusService:
                 FieldSchema(name="max_candidates", dtype=DataType.INT32),
                 FieldSchema(name="date_posted", dtype=DataType.INT64),
                 FieldSchema(name="date_expires", dtype=DataType.INT64),
-                
-                # Sparse vector field
-                FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
 
                 # Dense vector field
                 FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=self.dense_dim),
+                FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
             ]
-            
-            schema = CollectionSchema(fields=fields, description="Jobs collection")
-                 
+
+            schema = CollectionSchema(
+                fields=fields, 
+                description="Jobs collection",
+            )
+
             self.jobs_collection = Collection(
                 name=collection_name,
                 schema=schema
@@ -113,7 +115,7 @@ class MilvusService:
                 field_name="sparse_vector",
                 index_params={
                     "index_type": "SPARSE_INVERTED_INDEX",
-                    "metric_type": "IP"
+                    "metric_type": "IP",
                 },
             )
 
@@ -124,23 +126,103 @@ class MilvusService:
 
         self.jobs_collection.load()
         logger.info(f"Loaded collection: {collection_name}")
+    
+    def _setup_users_collection(self):
+        """Initialize users collection"""
         
-    def generate_embeddings(self, texts: List[str]) -> Dict[str, List[List[float]]]:
+        collection_name = "users"
+        
+        if not utility.has_collection(collection_name):
+            fields = [
+                FieldSchema(name="user_id", dtype=DataType.VARCHAR, max_length=50, is_primary=True, auto_id=False),
+                
+                # User metadata
+                FieldSchema(name="name", dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="email", dtype=DataType.VARCHAR, max_length=255),
+                
+                # Skills from NLP
+                FieldSchema(name="skills", dtype=DataType.ARRAY,element_type=DataType.VARCHAR,max_length=50,max_capacity=50),
+                
+                # Location from NLP
+                FieldSchema(name="location", dtype=DataType.VARCHAR, max_length=100),
+                
+                # Previous companies (from Resume if can extract)
+                FieldSchema(name="organizations", dtype=DataType.ARRAY, element_type=DataType.VARCHAR, max_length=100, max_capacity=10, nullable=True),
+                
+                # Vectors
+                FieldSchema(
+                    name="dense_vector",
+                    dtype=DataType.FLOAT_VECTOR,
+                    dim=self.dense_dim
+                ),
+                FieldSchema(
+                    name="sparse_vector",
+                    dtype=DataType.SPARSE_FLOAT_VECTOR
+                ),
+                
+                # Timestamps
+                FieldSchema(name="created_at", dtype=DataType.INT64),
+                FieldSchema(name="updated_at", dtype=DataType.INT64),
+            ]
+            
+            schema = CollectionSchema(fields=fields, description="Users collection")
+            self.user_collection = Collection(
+                name=collection_name,
+                schema=schema
+            )
+            
+            # Create indexes
+            self.user_collection.create_index(
+                field_name="dense_vector",
+                index_params={
+                    "index_type": "HNSW",
+                    "metric_type": "COSINE",
+                    "params": {"M": 16, "efConstruction": 200}
+                }
+            )
+            
+            self.user_collection.create_index(
+                field_name="sparse_vector",
+                index_params={
+                    "index_type": "SPARSE_INVERTED_INDEX",
+                    "metric_type": "IP"
+                }
+            )
+        
+            logger.info(f"Created new collection: {collection_name}")
+        else:
+            self.user_collection = Collection(name=collection_name)
+            logger.info(f"Using existing collection: {collection_name}")
+        self.user_collection.load()
+        logger.info(f"Loaded collection: {collection_name}")
+        return self.user_collection
+    
+    
+    
+    def generate_embeddings(self, texts: List[str]) -> Dict[str, object]:
         """Generate dense and sparse embeddings for given texts"""
         try:
-            embeddings = self.ef(texts)
-            return embeddings
+            embeddings = self.ef.encode_documents(texts)
+
+            return {
+                "dense": embeddings["dense"],
+                "sparse": embeddings["sparse"],
+            }
+
         except Exception as e:
             logger.error(f"Embedding generation failed: {e}")
             raise
+
     def upsert_jobs(self, entities: List[Dict[str, Any]]) -> int:
         """Upsert jobs into Milvus collection"""
         try:
             if not entities:
                 raise ValueError("No jobs to upsert")
             
-            self.jobs_collection.upsert(entities)
-            logger.info(f"Upserted {len(entities)} jobs into Milvus")
+            self.delete_jobs([entity["id"] for entity in entities])
+            
+            self.jobs_collection.insert(entities)
+            logger.info(f"Inserted {len(entities)} jobs into Milvus")
             return len(entities)
         except Exception as e:
             logger.error(f"Upsert failed: {e}")
@@ -159,33 +241,4 @@ class MilvusService:
         except Exception as e:
             logger.warning(f"Delete failed: {e}")
             return 0
-
-    def hybrid_search(
-        self,
-        dense_vec,
-        sparse_vec,
-        dense_weight=1.0,
-        sparse_weight=1.0,
-        offset=0,
-        limit=10,
-    ):
-        """Hybrid search in jobs collection"""
-        dense_req = AnnSearchRequest(
-            [dense_vec], "dense_vector", {"metric_type": "COSINE"}, limit=limit
-        )
-        sparse_req = AnnSearchRequest(
-            [sparse_vec], "sparse_vector", {"metric_type": "IP"}, limit=limit
-        )
-        rerank = WeightedRanker(sparse_weight, dense_weight)
-
-        # Only need id field for search results
-        output_fields = ["id"]
-
-        return self.jobs_collection.hybrid_search(
-            [sparse_req, dense_req],
-            rerank=rerank,
-            limit=limit,
-            offset=offset,
-            output_fields=output_fields,
-        )[0]
 
