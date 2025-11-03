@@ -1,7 +1,7 @@
 """Sync processor for handling job updates from outbox events"""
 import logging
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any
 from services.milvus_service import MilvusService
 from utils.data_processor import DataProcessor
 from models.job import Job
@@ -18,63 +18,51 @@ class SyncProcessor:
         self.milvus_service = milvus_service
 
     def sync_to_milvus(self, payload: Dict[str, Any]) -> SyncResult:
-        """Sync job to Milvus (for CREATED/UPDATED events)"""
-        try:
-            # Ensure payload is a list for processing
-            if isinstance(payload, dict) and "id" in payload:
-                jobs_data = [payload]
-            elif isinstance(payload, list):
-                jobs_data = payload
-            else:
-                logger.error(f"Invalid payload format: {type(payload)}")
-                return SyncResult(processed=0, inserted=0, deleted=0)
-            
-            # Convert to Job objects for type safety and validation
-            jobs = [Job.from_dict(job_data) for job_data in jobs_data]
-            jobs_dict = [job.to_dict() for job in jobs]  # For compatibility with existing DataProcessor
+        """Sync job to Milvus (for CREATED/UPDATED events). Returns a SyncResult."""
+        # Normalize payload -> list of job dicts
+        if isinstance(payload, dict) and "id" in payload:
+            jobs_data = [payload]
+        elif isinstance(payload, list):
+            jobs_data = payload
+        else:
+            logger.error(f"Invalid payload format: {type(payload)}")
+            return SyncResult(processed=0, inserted=0, deleted=0, error="invalid_payload")
 
-            # Generate embeddings using job data
-            combined_texts = [
-                DataProcessor.combine_job_text(job_dict) for job_dict in jobs_dict
-            ]
+        try:
+            jobs = [Job.from_dict(job_data) for job_data in jobs_data]
+            jobs_dict = [job.to_dict() for job in jobs]
+
+            combined_texts = [DataProcessor.combine_job_text(j) for j in jobs_dict]
             embeddings = self.milvus_service.generate_embeddings(combined_texts)
 
-            # Build entities
             entities = DataProcessor.build_entities(
-                jobs_dict, embeddings, self.milvus_service.dense_dim
+                dense_vecs=embeddings.get("dense", []),
+                sparse_vecs=embeddings.get("sparse", []),
+                jobs=jobs_dict,
             )
 
-            # Delete existing jobs (upsert behavior)
-            job_ids = entities[0]
-            deleted = self.milvus_service.delete_jobs(job_ids)
-
-            # Insert/update jobs
-            inserted = self.milvus_service.insert_jobs(entities)
-
-            logger.info(
-                f"Synced to Milvus: {len(jobs)} jobs, deleted={deleted}, inserted={inserted}"
-            )
-            return SyncResult(processed=len(jobs), inserted=inserted, deleted=deleted)
-
+            upserted = self.milvus_service.upsert_jobs(entities)
+            logger.info(f"Synced to Milvus: {len(jobs)} jobs, upserted={upserted}")
+            return SyncResult(processed=len(jobs), inserted=upserted, deleted=0)
         except Exception as e:
             logger.exception(f"Failed to sync to Milvus: {e}")
-            raise
+            return SyncResult(processed=0, inserted=0, deleted=0, error=str(e))
 
     def delete_from_milvus(self, aggregate_id: str) -> SyncResult:
         """Delete job from Milvus (for DELETED events)"""
         try:
             job_id = int(aggregate_id)
-            deleted = self.milvus_service.delete_jobs([job_id])
-            
-            logger.info(f"Deleted from Milvus: job_id={job_id}, deleted={deleted}")
-            return SyncResult(processed=1, inserted=0, deleted=deleted)
-        
         except ValueError:
             logger.error(f"Invalid aggregate_id format: {aggregate_id}")
-            return SyncResult(processed=0, inserted=0, deleted=0)
+            return SyncResult(processed=0, inserted=0, deleted=0, error="invalid_aggregate_id")
+
+        try:
+            deleted = self.milvus_service.delete_jobs([job_id])
+            logger.info(f"Deleted from Milvus: job_id={job_id}, deleted={deleted}")
+            return SyncResult(processed=1, inserted=0, deleted=deleted)
         except Exception as e:
             logger.exception(f"Failed to delete from Milvus: {e}")
-            raise
+            return SyncResult(processed=0, inserted=0, deleted=0, error=str(e))
 
     def process_stream_message(self, fields: Dict[str, str]) -> SyncResult:
         """
@@ -129,13 +117,11 @@ class SyncProcessor:
                     return SyncResult(processed=0, inserted=0, deleted=0, error=str(e))
 
                 logger.info(
-                    f"Processing {event.event_type.value} event: aggregateId={event.aggregate_id}, "
-                    f"traceId={event.trace_id}"
+                    f"Processing {event.event_type.value} event: aggregateId={event.aggregate_id}, traceId={event.trace_id}"
                 )
                 result = self.sync_to_milvus(payload)
                 logger.info(
-                    f"Completed {event.event_type.value} event: aggregateId={event.aggregate_id}, "
-                    f"traceId={event.trace_id}, result={result.to_dict()}"
+                    f"Completed {event.event_type.value} event: aggregateId={event.aggregate_id}, traceId={event.trace_id}, result={result.to_dict()}"
                 )
                 return result
 
@@ -168,9 +154,7 @@ class SyncProcessor:
             logger.error(f"Failed to parse payload JSON: {e}, fields={fields}")
             return SyncResult(processed=0, inserted=0, deleted=0, error=str(e))
         except Exception as e:
-            logger.exception(
-                f"Failed to process stream message: {e}, fields={fields}"
-            )
+            logger.exception(f"Failed to process stream message: {e}, fields={fields}")
             return SyncResult(processed=0, inserted=0, deleted=0, error=str(e))
 
 

@@ -43,7 +43,7 @@ class OutboxEvent:
         try:
             event_type = EventType(event_type_str)
         except ValueError:
-            event_type = EventType.CREATED  # Default fallback
+            raise ValueError(f"Invalid event type: {event_type_str}")
 
         attempts = int(fields.get("attempts", "0"))
 
