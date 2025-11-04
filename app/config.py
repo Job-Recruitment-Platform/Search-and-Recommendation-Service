@@ -30,4 +30,4 @@ class Config:
     # Search configuration
     SEARCH_DEFAULT_LIMIT: int = int(os.getenv("SEARCH_DEFAULT_LIMIT", "10"))
     SEARCH_DEFAULT_OFFSET: int = int(os.getenv("SEARCH_DEFAULT_OFFSET", "0"))
-
+    SEARCH_THRESHOLD: float = float(os.getenv("SEARCH_THRESHOLD", "0.5"))

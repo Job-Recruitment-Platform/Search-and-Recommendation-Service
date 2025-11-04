@@ -19,6 +19,57 @@ from app.config import Config
 logger = logging.getLogger(__name__)
 
 
+jobs_collection_schema = {
+    "name": "jobs",
+    "description": "Jobs collection",
+    "fields": [
+        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
+        # Basic job info fields for search
+        FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=100),
+        FieldSchema(name="skills", dtype=DataType.VARCHAR, max_length=100),
+        FieldSchema(name="location", dtype=DataType.VARCHAR, max_length=100),
+        
+        # Filterable fields
+        FieldSchema(name="company", dtype=DataType.VARCHAR, max_length=100),
+        FieldSchema(name="job_role", dtype=DataType.VARCHAR, max_length=100),
+        FieldSchema(name="seniority", dtype=DataType.VARCHAR, max_length=50),
+        FieldSchema(name="min_experience_years", dtype=DataType.INT32),
+        FieldSchema(name="work_mode", dtype=DataType.VARCHAR, max_length=10),
+        FieldSchema(name="salary_min", dtype=DataType.INT32),
+        FieldSchema(name="salary_max", dtype=DataType.INT32),
+        FieldSchema(name="currency", dtype=DataType.VARCHAR, max_length=10),
+        FieldSchema(name="status", dtype=DataType.VARCHAR, max_length=20),
+        
+        # Other metadata fields
+        FieldSchema(name="max_candidates", dtype=DataType.INT32),
+        FieldSchema(name="date_posted", dtype=DataType.INT64),
+        FieldSchema(name="date_expires", dtype=DataType.INT64),
+        
+        # Vector fields
+        FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=1024),
+        FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
+    ],
+    "indexes": [
+        {
+            "field_name": "dense_vector",
+            "index_params": {
+                "index_type": "HNSW",
+                "metric_type": "COSINE",
+                "params": {"M": 16, "efConstruction": 200},
+            },
+        },
+        {
+            "field_name": "sparse_vector",
+            "index_params": {
+                "index_type": "SPARSE_INVERTED_INDEX",
+                "metric_type": "IP",
+            },
+        },
+    ],
+}
+
+
+
 class MilvusService:
     """Service for Milvus vector database operations"""
 
@@ -49,155 +100,39 @@ class MilvusService:
             logger.info("Initialized BGEM3 embedding function")
 
             # Setup collection
-            self._setup_jobs_collection()
+            self.jobs_collection = self._setup_collection(jobs_collection_schema)
 
         except Exception as e:
             logger.error(f"Failed to connect to Milvus: {e}")
             raise
 
-    def _setup_jobs_collection(self):
-        """Initialize Milvus collection for jobs"""
-        collection_name = "jobs"
+    def _setup_collection(self, schema: Dict[str, Any]):
+        """Initialize Milvus collection"""
+        collection_name = schema["name"]
+
         if not utility.has_collection(collection_name):
-
-            fields = [
-                FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
-
-                FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="skills", dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="location", dtype=DataType.VARCHAR, max_length=100),
-
-                # Filterable fields
-                FieldSchema(name="company", dtype=DataType.VARCHAR, max_length=100),  # e.g., "Acme Corp"
-                FieldSchema(name="job_role", dtype=DataType.VARCHAR, max_length=100), # e.g., "Software Engineer"
-                FieldSchema(name="seniority", dtype=DataType.VARCHAR, max_length=50), # e.g., "Junior", "Mid", "Senior", etc...
-                FieldSchema(name="min_experience_years", dtype=DataType.INT32),
-                FieldSchema(name="work_mode", dtype=DataType.VARCHAR, max_length=10), # e.g., "Remote", "Onsite", "Hybrid"
-                FieldSchema(name="salary_min", dtype=DataType.INT32),                 # e.g., 60000
-                FieldSchema(name="salary_max", dtype=DataType.INT32),                 # e.g., 120000
-                FieldSchema(name="currency", dtype=DataType.VARCHAR, max_length=10),  # e.g., "USD", "EUR", "GBP", etc...
-                FieldSchema(name="status", dtype=DataType.VARCHAR, max_length=20),    # e.g., "PUBLISHED", "DRAFT", "PENDING", "EXPIRED", "CANCELED"
-                
-                # Other metadata fields
-                FieldSchema(name="max_candidates", dtype=DataType.INT32),
-                FieldSchema(name="date_posted", dtype=DataType.INT64),
-                FieldSchema(name="date_expires", dtype=DataType.INT64),
-
-                # Dense vector field
-                FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=self.dense_dim),
-                FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
-            ]
-
-            schema = CollectionSchema(
-                fields=fields, 
-                description="Jobs collection",
+            fields = schema["fields"]
+            collection_schema = CollectionSchema(
+                fields=fields, description=schema.get("description", "")
             )
-
-            self.jobs_collection = Collection(
+            collection = Collection(
                 name=collection_name,
-                schema=schema
+                schema=collection_schema
             )
-           
-            logger.info(f"Created new collection: {collection_name}")
-
-            # Create index for dense vector
-            self.jobs_collection.create_index(
-                field_name="dense_vector",
-                index_params={
-                    "index_type": "HNSW",
-                    "metric_type": "COSINE",
-                    "params": {"M": 16, "efConstruction": 200},
-                },
-            )
-
-            # Create index for sparse vector
-            self.jobs_collection.create_index(
-                field_name="sparse_vector",
-                index_params={
-                    "index_type": "SPARSE_INVERTED_INDEX",
-                    "metric_type": "IP",
-                },
-            )
-
-            logger.info(f"Created indexes for collection: {collection_name}")
-        else:
-            self.jobs_collection = Collection(name=collection_name)
-            logger.info(f"Using existing collection: {collection_name}")
-
-        self.jobs_collection.load()
-        logger.info(f"Loaded collection: {collection_name}")
-    
-    def _setup_users_collection(self):
-        """Initialize users collection"""
-        
-        collection_name = "users"
-        
-        if not utility.has_collection(collection_name):
-            fields = [
-                FieldSchema(name="user_id", dtype=DataType.VARCHAR, max_length=50, is_primary=True, auto_id=False),
-                
-                # User metadata
-                FieldSchema(name="name", dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="email", dtype=DataType.VARCHAR, max_length=255),
-                
-                # Skills from NLP
-                FieldSchema(name="skills", dtype=DataType.ARRAY,element_type=DataType.VARCHAR,max_length=50,max_capacity=50),
-                
-                # Location from NLP
-                FieldSchema(name="location", dtype=DataType.VARCHAR, max_length=100),
-                
-                # Previous companies (from Resume if can extract)
-                FieldSchema(name="organizations", dtype=DataType.ARRAY, element_type=DataType.VARCHAR, max_length=100, max_capacity=10, nullable=True),
-                
-                # Vectors
-                FieldSchema(
-                    name="dense_vector",
-                    dtype=DataType.FLOAT_VECTOR,
-                    dim=self.dense_dim
-                ),
-                FieldSchema(
-                    name="sparse_vector",
-                    dtype=DataType.SPARSE_FLOAT_VECTOR
-                ),
-                
-                # Timestamps
-                FieldSchema(name="created_at", dtype=DataType.INT64),
-                FieldSchema(name="updated_at", dtype=DataType.INT64),
-            ]
-            
-            schema = CollectionSchema(fields=fields, description="Users collection")
-            self.user_collection = Collection(
-                name=collection_name,
-                schema=schema
-            )
-            
             # Create indexes
-            self.user_collection.create_index(
-                field_name="dense_vector",
-                index_params={
-                    "index_type": "HNSW",
-                    "metric_type": "COSINE",
-                    "params": {"M": 16, "efConstruction": 200}
-                }
-            )
-            
-            self.user_collection.create_index(
-                field_name="sparse_vector",
-                index_params={
-                    "index_type": "SPARSE_INVERTED_INDEX",
-                    "metric_type": "IP"
-                }
-            )
-        
+            for index in schema.get("indexes", []):
+                collection.create_index(
+                    field_name=index["field_name"],
+                    index_params=index["index_params"]
+                )
             logger.info(f"Created new collection: {collection_name}")
         else:
-            self.user_collection = Collection(name=collection_name)
+            collection = Collection(name=collection_name)
             logger.info(f"Using existing collection: {collection_name}")
-        self.user_collection.load()
+
+        collection.load()
         logger.info(f"Loaded collection: {collection_name}")
-        return self.user_collection
-    
-    
+        return collection
     
     def generate_embeddings(self, texts: List[str]) -> Dict[str, object]:
         """Generate dense and sparse embeddings for given texts"""

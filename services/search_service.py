@@ -23,6 +23,7 @@ class SearchService:
         query: str,
         limit: int = 10,
         offset: int = 0,
+        threshold: float = Config.SEARCH_THRESHOLD,
     ) -> Tuple[List[int], PaginationInfo]:
         """Perform hybrid search for jobs
         Returns:
@@ -42,29 +43,34 @@ class SearchService:
             data=[dense_vec],
             anns_field="dense_vector",
             param={"metric_type": "COSINE"},
-            limit=limit
+            limit=limit+1
         )
         
         sparse_req = AnnSearchRequest(
             data=[sparse_vec],
             anns_field="sparse_vector",
             param={"metric_type": "IP"},
-            limit=limit
+            limit=limit+1
         )
-
         results = self.milvus_service.jobs_collection.hybrid_search(
             reqs=[dense_req, sparse_req],
             rerank=WeightedRanker(float(0.5), float(0.5)),
             offset=offset,
-            limit=limit,
+            limit=limit+1,
             output_fields=["id"],
         )
         job_ids = []
-        has_next = len(results) > limit
         for hits in results:
             for hit in hits:
+                if hit.score is None or hit.score < float(threshold):
+                    continue
                 job_ids.append(hit.entity.get("id"))
-                logger.info(f"Hit: id={hit.entity.get('id')}, score={hit.score}")
+                logger.info(
+                    f"Hit: id={hit.entity.get('id')}, score={hit.score}, threshold={threshold}"
+                )
+                
+        has_next = len(job_ids) > limit
+        job_ids = job_ids[:limit]
         # Build pagination info
         pagination = PaginationInfo(
             limit=limit,
