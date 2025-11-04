@@ -54,7 +54,7 @@ class SearchService:
         )
         results = self.milvus_service.jobs_collection.hybrid_search(
             reqs=[dense_req, sparse_req],
-            rerank=WeightedRanker(float(0.5), float(0.5)),
+            rerank=WeightedRanker(float(0.4), float(0.6)),
             offset=offset,
             limit=limit+1,
             output_fields=["id"],

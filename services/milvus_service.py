@@ -28,7 +28,7 @@ jobs_collection_schema = {
         FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=100),
         FieldSchema(name="skills", dtype=DataType.VARCHAR, max_length=100),
         FieldSchema(name="location", dtype=DataType.VARCHAR, max_length=100),
-        
+        FieldSchema(name="description", dtype=DataType.VARCHAR, max_length=3000),        
         # Filterable fields
         FieldSchema(name="company", dtype=DataType.VARCHAR, max_length=100),
         FieldSchema(name="job_role", dtype=DataType.VARCHAR, max_length=100),
@@ -68,6 +68,25 @@ jobs_collection_schema = {
     ],
 }
 
+users_collection_schema = {
+    "name": "users",
+    "description": "Users collection",
+    "fields": [
+        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
+        FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=1024),
+    ],
+    "indexes": [
+        {
+            "field_name": "dense_vector",
+            "index_params": {
+                "index_type": "HNSW",
+                "metric_type": "COSINE",
+                "params": {"M": 16, "efConstruction": 200},
+            },
+        },
+    ],
+}
+
 
 
 class MilvusService:
@@ -98,7 +117,6 @@ class MilvusService:
             )
             self.dense_dim = self.ef.dim["dense"]
             logger.info("Initialized BGEM3 embedding function")
-
             # Setup collection
             self.jobs_collection = self._setup_collection(jobs_collection_schema)
 

@@ -52,6 +52,7 @@ class DataProcessor:
             title = DataProcessor.clean_text(job.get("title", ""))
             skills = DataProcessor.extract_skill_names(job.get("skills", []))
             location = DataProcessor.clean_text(job.get("location", ""))
+            description = DataProcessor.clean_text(job.get("description", ""))
             
             company = DataProcessor.clean_text(job.get("company", ""))
             job_role = DataProcessor.clean_text(job.get("job_role", ""))
@@ -72,6 +73,7 @@ class DataProcessor:
                 "title": title,
                 "skills": skills,
                 "location": location,
+                "description": description,
                 "company": company,
                 "job_role": job_role,
                 "seniority": seniority,
@@ -124,10 +126,9 @@ class DataProcessor:
     
     @staticmethod
     def combine_job_text(job: Dict) -> str:
-        """Combine relevant job fields into a single text string for embedding generation"""
+        """Combine only title, skills, location for sparse text embedding"""
         title = DataProcessor.clean_text(job.get("title", ""))
-        skills = " ".join(DataProcessor.extract_skill_names(job.get("skills", [])))
+        skills = DataProcessor.extract_skill_names(job.get("skills", []))
         location = DataProcessor.clean_text(job.get("location", ""))
-
         combined_text = f"{title} {skills} {location}"
         return combined_text

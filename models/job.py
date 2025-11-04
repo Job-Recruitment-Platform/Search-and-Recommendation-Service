@@ -45,6 +45,7 @@ class Job:
     id: int
     title: str = ""
     company: str = ""
+    description: str = ""
     job_role: str = ""
     seniority: str = ""
     location: str = ""
@@ -59,7 +60,6 @@ class Job:
     date_posted: int = 0  # timestamp in milliseconds
     date_expires: int = 0  # timestamp in milliseconds
 
-    # Alias fields for camelCase compatibility
     @property
     def jobRole(self) -> str:
         return self.job_role
@@ -111,6 +111,7 @@ class Job:
             id=int(data.get("id", 0)),
             title=data.get("title", ""),
             company=data.get("company", ""),
+            description=data.get("description", ""),
             job_role=data.get("job_role") or data.get("jobRole", ""),
             seniority=data.get("seniority", ""),
             location=data.get("location", ""),

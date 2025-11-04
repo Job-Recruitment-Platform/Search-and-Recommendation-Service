@@ -19,25 +19,28 @@ class SyncProcessor:
 
     def sync_to_milvus(self, payload: Dict[str, Any]) -> SyncResult:
         """Sync job to Milvus (for CREATED/UPDATED events). Returns a SyncResult."""
-        
-        jobs_data = [payload]
-
         try:
-            jobs = [Job.from_dict(job_data) for job_data in jobs_data]
-            jobs_dict = [job.to_dict() for job in jobs]
-
-            combined_texts = [DataProcessor.combine_job_text(j) for j in jobs_dict]
-            embeddings = self.milvus_service.generate_embeddings(combined_texts)
-
+            job = Job.from_dict(payload)
+            # Sparse: only title + skills + location
+            sparse_text = DataProcessor.combine_job_text(job.to_dict(False))
+            logger.info(sparse_text)
+            # Dense: description only
+            dense_text = job.description
+            logger.info(dense_text)
+            # Generate embeddings (expects list[str])
+            sparse_vec = self.milvus_service.generate_embeddings([sparse_text]).get("sparse")
+            dense_vec = self.milvus_service.generate_embeddings([dense_text]).get("dense")
+            
+            # Build single-entity upsert payload
             entities = DataProcessor.build_entities(
-                dense_vecs=embeddings.get("dense"),
-                sparse_vecs=embeddings.get("sparse"),
-                jobs=jobs_dict,
+                dense_vecs=dense_vec,
+                sparse_vecs=sparse_vec,
+                jobs=[job.to_dict(False)],
             )
 
             upserted = self.milvus_service.upsert_jobs(entities)
-            logger.info(f"Synced to Milvus: {len(jobs)} jobs, upserted={upserted}")
-            return SyncResult(processed=len(jobs), inserted=upserted, deleted=0)
+            logger.info(f"Synced to Milvus: 1 jobs, upserted={upserted}")
+            return SyncResult(processed=1, inserted=upserted, deleted=0)
         except Exception as e:
             logger.exception(f"Failed to sync to Milvus: {e}")
             return SyncResult(processed=0, inserted=0, deleted=0, error=str(e))
