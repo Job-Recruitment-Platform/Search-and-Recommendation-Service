@@ -2,6 +2,7 @@
 import logging
 from flask import Flask
 from services.search_service import SearchService
+from services.recommend import RecommendationService
 from services.milvus_service import MilvusService
 from app.routes import create_routes
 
@@ -21,9 +22,10 @@ def create_app() -> Flask:
     # Initialize services
     milvus_service = MilvusService()
     search_service = SearchService(milvus_service)
+    recommend_service = RecommendationService(milvus_service)
 
     # Register routes
-    create_routes(app, search_service)
+    create_routes(app, search_service, recommend_service)
 
     logger.info("Flask application created successfully")
     return app

@@ -1,6 +1,6 @@
 """Milvus service for vector database operations"""
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pymilvus import (
     connections,
     FieldSchema,
@@ -196,6 +196,22 @@ class MilvusService:
         except Exception as e:
             logger.error(f"Failed to upsert user vector for {user_id}: {e}")
             raise
+    
+    def get_user_vector(self, user_id: int) -> Optional[List[float]]:
+        """Get user vector from Milvus collection"""
+        try:
+            if not self.users_collection:
+                return None
+            results = self.users_collection.query(
+                expr=f"id == {int(user_id)}",
+                output_fields=["dense_vector"],
+                limit=1,
+            )
+            if results and isinstance(results, list) and len(results) > 0:
+                return list(results[0].get("dense_vector", []))
+        except Exception as e:
+            logger.warning(f"Failed to get user vector for {user_id}: {e}")
+        return None
 
     def upsert_jobs(self, entities: List[Dict[str, Any]]) -> int:
         """Upsert jobs into Milvus collection"""

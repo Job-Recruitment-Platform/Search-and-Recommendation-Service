@@ -2,9 +2,14 @@ from typing import Dict, Any, List, Optional
 import math
 import json
 from datetime import datetime, timezone
-from collections import Counter
+from collections import Counter, defaultdict
 import redis
 import numpy as np
+import os
+import pickle
+import requests
+import threading
+import time
 
 from services.milvus_service import MilvusService
 from app.config import INTERACTION_WEIGHTS, Config
@@ -13,6 +18,12 @@ from app.config import INTERACTION_WEIGHTS, Config
 class RecommendationService:
     def __init__(self, milvus_service: MilvusService):
         self.milvus_service = milvus_service
+        # Try load CF model (optional)
+        self.cf_model = None
+        self.cf_user_id_to_index = None
+        self.cf_item_id_to_index = None
+        self.cf_index_to_item_id = None
+        self._load_cf_model()
         # Initialize Redis client for short-term vector caching
         try:
             self.redis_client = redis.Redis(
@@ -26,72 +37,361 @@ class RecommendationService:
         except Exception as e:
             print(f"Warning: Failed to connect to Redis: {e}")
             self.redis_client = None
+        
+        # Start interaction stream consumer in background
+        self._start_interaction_consumer()
 
     def recommend(
         self, 
         user_id: int, 
-        top_k: int = 20, 
-        filters: Optional[Dict] = None
+        top_k: int = 20
     ) -> List[Dict[str, Any]]:
-        """Main recommendation endpoint - MVP version
-        
-        Args:
-            user_id: User ID to get recommendations for
-            top_k: Number of recommendations to return
-            filters: Optional filters (e.g., location, job_type, salary_range)
-        
-        Returns:
-            List of job recommendations with scores
+        """Hybrid recommendation entrypoint.
+
+        Tách candidate generation và ranking:
+        - Candidate: kết hợp CF + content để tăng coverage
+        - Ranking: áp dụng trọng số nguồn + exploration post-processing
         """
         try:
-            # 1. Get user data
             user_profile = self._get_user_profile(user_id)
             user_interactions = self._get_user_interactions(user_id)
             
-            if not user_profile:
-                # Cold start: return popular jobs
-                return self._get_popular_jobs(top_k, filters)
-            
-            # 2. Calculate user vector (combines profile + interactions)
-            user_vector = self._calculate_user_vector(user_profile, user_interactions)
-            
-            if not user_vector:
-                return self._get_popular_jobs(top_k, filters)
-            
-            # 3. Search Milvus for similar jobs
-            search_limit = top_k * 3  # Get more candidates for re-ranking
-            
-            search_results = self.milvus_service.search(
-                collection_name="jobs",
-                query_vectors=[user_vector],
-                limit=search_limit,
-                output_fields=["job_id", "title", "company", "location", "salary_range"],
-                # Apply filters if provided
-                expr=self._build_filter_expr(filters) if filters else None
+            candidates = self._generate_candidates(
+                user_id=user_id,
+                user_profile=user_profile,
+                user_interactions=user_interactions,
+                top_k=top_k,
             )
+
+            if not candidates:
+                return self._get_popular_jobs(top_k)
             
-            if not search_results or not search_results[0]:
-                return self._get_popular_jobs(top_k, filters)
-            
-            # 4. Format results
-            recommendations = []
-            for hit in search_results[0][:top_k]:  # Take top_k after search
-                recommendations.append({
-                    "job_id": hit.get("job_id") or hit.id,
-                    "title": hit.get("title", ""),
-                    "company": hit.get("company", ""),
-                    "location": hit.get("location", ""),
-                    "salary_range": hit.get("salary_range", ""),
-                    "score": float(hit.score) if hasattr(hit, 'score') else 0.0,
-                    "source": "content_based"
-                })
-            
-            return recommendations
-            
+            ranked = self._rank_candidates(
+                user_id=user_id,
+                candidates=candidates,
+                user_interactions=user_interactions,
+                top_k=top_k,
+            )
+
+            return ranked or self._get_popular_jobs(top_k)
+
         except Exception as e:
             print(f"Error in recommend(): {e}")
-            # Fallback to popular jobs
-            return self._get_popular_jobs(top_k, filters)
+            return self._get_popular_jobs(top_k)
+    def _generate_candidates(
+        self,
+        user_id: int,
+        user_profile: Optional[Dict[str, Any]],
+        user_interactions: Optional[Dict[str, Any]],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """Hybrid candidate generation (CF + content + tiêu chuẩn fallback)."""
+
+        candidate_map: Dict[int, Dict[str, Any]] = {}
+
+        def ensure_candidate(job_id: int) -> Dict[str, Any]:
+            entry = candidate_map.get(job_id)
+            if entry is None:
+                entry = {
+                    "job_id": job_id,
+                    "score_sources": {},
+                    "sources": set(),
+                }
+                candidate_map[job_id] = entry
+            return entry
+
+        # CF candidates
+        for cand in self._generate_cf_candidates(user_id=user_id, limit=top_k * 2):
+            entry = ensure_candidate(cand["job_id"])
+            entry["score_sources"]["cf"] = cand["score"]
+            entry["sources"].add("cf")
+
+        # Content-based candidates
+        for cand in self._generate_content_candidates(
+            user_id=user_id,
+            user_profile=user_profile,
+            user_interactions=user_interactions,
+            limit=top_k * 3,
+        ):
+            entry = ensure_candidate(cand["job_id"])
+            entry["score_sources"]["content"] = cand["score"]
+            entry["sources"].add("content")
+
+        # Coverage boost: nếu vẫn thiếu candidate, bổ sung popular
+        if not candidate_map or len(candidate_map) < top_k:
+            for cand in self._generate_popular_candidates(limit=top_k * 2):
+                entry = ensure_candidate(cand["job_id"])
+                entry["score_sources"].setdefault("popular", cand["score"])
+                entry["sources"].add("popular")
+
+        return list(candidate_map.values())
+
+    def _load_cf_model(self) -> None:
+        """Load CF model and mappings from pickle if available."""
+        try:
+            path = getattr(Config, "CF_MODEL_PATH", "")
+            if not path or not os.path.exists(path):
+                return
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            self.cf_model = data.get("model")
+            self.cf_user_id_to_index = data.get("user_id_to_index")
+            self.cf_item_id_to_index = data.get("item_id_to_index")
+            self.cf_index_to_item_id = data.get("index_to_item_id")
+        except Exception as e:
+            print(f"Warning: Failed to load CF model: {e}")
+            self.cf_model = None
+
+    def _generate_cf_candidates(self, user_id: int, limit: int) -> List[Dict[str, Any]]:
+        """Sinh candidate từ mô hình CF (ALS); trả [] nếu không khả dụng."""
+        try:
+            if not self.cf_model or not self.cf_user_id_to_index or not self.cf_index_to_item_id:
+                return []
+            if user_id not in self.cf_user_id_to_index:
+                return []
+            user_idx = self.cf_user_id_to_index[user_id]
+            # Build dummy user-items row from available data: need the user_item row. We don't have matrix here.
+            # Use model.recommend with user_items=None not allowed; instead pass empty csr row.
+            from scipy.sparse import csr_matrix
+            max_item_index = max(self.cf_index_to_item_id.keys()) if self.cf_index_to_item_id else -1
+            num_items = max_item_index + 1 if max_item_index >= 0 else 1
+            user_items = csr_matrix((1, num_items))
+            ids, scores = self.cf_model.recommend(
+                userid=user_idx,
+                user_items=user_items,
+                N=limit,
+                filter_already_liked_items=True,
+            )
+            results: List[Dict[str, Any]] = []
+            for idx, score in zip(ids, scores):
+                job_id = self.cf_index_to_item_id.get(int(idx))
+                if job_id is None:
+                    continue
+                results.append({
+                    "job_id": int(job_id),
+                    "score": float(score),
+                })
+            return results
+        except Exception:
+            return []
+
+    def _generate_popular_candidates(
+        self,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Chuyển danh sách job phổ biến thành candidate chuẩn hoá."""
+        popular_jobs = self._get_popular_jobs(limit)
+        candidates: List[Dict[str, Any]] = []
+        for rank, job in enumerate(popular_jobs or []):
+            job_id = job.get("job_id")
+            if job_id is None:
+                continue
+            score = job.get("score")
+            if score is None:
+                score = max(0.0, (limit - rank) / max(1, limit))
+            candidate = {
+                "job_id": int(job_id),
+                "score": float(score),
+            }
+            candidates.append(candidate)
+        return candidates
+
+    def _rank_candidates(
+        self,
+        user_id: int,
+        candidates: List[Dict[str, Any]],
+        user_interactions: Optional[Dict[str, Any]],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """Xếp hạng candidate với chiến lược hybrid + exploration."""
+
+        seen_job_ids = self._collect_seen_job_ids(user_interactions)
+        ranked_results: List[Dict[str, Any]] = []
+
+        for candidate in candidates:
+            job_id = candidate["job_id"]
+            score_sources = candidate.get("score_sources", {})
+
+            cf_score = score_sources.get("cf")
+            content_score = score_sources.get("content")
+            popular_score = score_sources.get("popular")
+
+            combined = 0.0
+            if cf_score is not None:
+                combined += 0.65 * self._normalize_cf_score(cf_score)
+            if content_score is not None:
+                combined += 0.35 * self._normalize_content_score(content_score)
+            if popular_score is not None and cf_score is None and content_score is None:
+                combined += 0.25 * self._normalize_content_score(popular_score)
+
+            # Boost nếu candidate đến từ nhiều nguồn
+            num_sources = len(candidate.get("sources", []))
+            if num_sources > 1:
+                combined += 0.05 * (num_sources - 1)
+
+            # Exploration bonus cho job chưa từng tương tác
+            if job_id not in seen_job_ids:
+                combined += self._exploration_bonus(job_id)
+            else:
+                combined *= 0.85  # giảm ưu tiên job đã xem
+
+            ranked_results.append({
+                "job_id": job_id,
+                "score": combined,
+            })
+
+        ranked_results.sort(key=lambda item: item["score"], reverse=True)
+        top_results = ranked_results[:top_k]
+        return [{"job_id": item["job_id"]} for item in top_results]
+
+    def _normalize_cf_score(self, score: float) -> float:
+        """Chuyển score CF (ALS) về [0, 1] bằng logistic."""
+        try:
+            return 1.0 / (1.0 + math.exp(-float(score)))
+        except Exception:
+            return 0.0
+
+    def _normalize_content_score(self, score: float) -> float:
+        """Chuẩn hoá score cosine về [0, 1]."""
+        try:
+            val = float(score)
+        except Exception:
+            return 0.0
+        val = max(-1.0, min(1.0, val))
+        return (val + 1.0) / 2.0
+
+    def _exploration_bonus(self, job_id: int) -> float:
+        """Bonus deterministic cho exploration."""
+        hashed = hash(("explore", int(job_id)))
+        noise = (hashed & 0xFFFF) / 0xFFFF  # 0..1
+        return 0.03 + 0.02 * noise
+
+    def _collect_seen_job_ids(self, interactions: Optional[Dict[str, Any]]) -> set:
+        """Tập job user đã tương tác."""
+        seen: set = set()
+        if not interactions:
+            return seen
+        for entries in interactions.values():
+            if isinstance(entries, dict):
+                seen.update(int(jid) for jid in entries.keys() if str(jid).isdigit())
+            elif isinstance(entries, (list, tuple, set)):
+                for jid in entries:
+                    try:
+                        seen.add(int(jid))
+                    except Exception:
+                        continue
+        return seen
+
+    def _hydrate_candidate_metadata(self, candidate_map: Dict[int, Dict[str, Any]]) -> None:
+        """Bổ sung metadata còn thiếu cho candidate (nếu có API hỗ trợ)."""
+        missing_ids = [job_id for job_id, data in candidate_map.items() if not data.get("metadata")]
+        if not missing_ids:
+            return
+        try:
+            metadata_list = self._get_jobs_metadata([str(job_id) for job_id in missing_ids])
+        except Exception:
+            return
+        if not metadata_list:
+            return
+        metadata_by_id = {}
+        for item in metadata_list:
+            if not isinstance(item, dict):
+                continue
+            raw_id = item.get("job_id") or item.get("id")
+            if raw_id is None:
+                continue
+            try:
+                metadata_by_id[int(raw_id)] = item
+            except Exception:
+                continue
+        for job_id, meta in metadata_by_id.items():
+            if job_id not in candidate_map:
+                continue
+            entry = candidate_map[job_id]
+            metadata = entry.setdefault("metadata", {})
+            metadata.setdefault("title", meta.get("title", ""))
+            metadata.setdefault("company", meta.get("company", ""))
+            metadata.setdefault("location", meta.get("location", ""))
+            metadata.setdefault("salary_range", meta.get("salary_range", ""))
+
+    def _generate_content_candidates(
+        self,
+        user_id: int,
+        user_profile: Optional[Dict[str, Any]],
+        user_interactions: Optional[Dict[str, Any]],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Sinh candidate dựa trên vector nội dung (Milvus)."""
+
+        if not user_profile and not user_interactions:
+            return []
+
+        user_vector: List[float] = []
+        if user_profile:
+            user_vector = self._calculate_user_vector(user_profile, user_interactions or {})
+        elif user_interactions:
+            user_vector = self._calculate_short_term_user_vector(user_id, user_interactions)
+        
+        if not user_vector:
+            return []
+        
+        try:
+            # Use Milvus collection hybrid_search with dense vector only
+            from pymilvus import AnnSearchRequest
+            
+            dense_req = AnnSearchRequest(
+                data=[user_vector],
+                anns_field="dense_vector",
+                param={"metric_type": "COSINE"},
+                limit=max(1, limit),
+            )
+            
+            # hybrid_search requires rerank parameter, use WeightedRanker with weight 1.0 for dense only
+            from pymilvus import WeightedRanker
+            
+            search_results = self.milvus_service.jobs_collection.hybrid_search(
+                reqs=[dense_req],
+                rerank=WeightedRanker(float(1.0)),
+                limit=max(1, limit),
+                output_fields=["id"],
+            )
+        except Exception as err:
+            print(f"Warning: content candidate search failed: {err}")
+            return []
+        
+        if not search_results or len(search_results) == 0 or not search_results[0]:
+            return []
+
+        hits = search_results[0]
+        candidates: List[Dict[str, Any]] = []
+        for hit in hits:
+            # Handle Milvus hit object format (similar to SearchService)
+            job_id = None
+            score = 0.0
+            
+            if hasattr(hit, "entity"):
+                # Milvus hit object
+                job_id = hit.entity.get("id") if hasattr(hit.entity, "get") else getattr(hit.entity, "id", None)
+                score = getattr(hit, "score", 0.0)
+            elif isinstance(hit, dict):
+                # Dictionary format
+                job_id = hit.get("id") or hit.get("job_id")
+                score = hit.get("score", 0.0)
+            else:
+                # Try to get attributes directly
+                job_id = getattr(hit, "id", None)
+                score = getattr(hit, "score", 0.0)
+            
+            if job_id is None:
+                continue
+                
+            candidate = {
+                "job_id": int(job_id),
+                "score": float(score) if score is not None else 0.0,
+            }
+            candidates.append(candidate)
+
+        return candidates
 
     def _calculate_long_term_user_vector(
         self, 
@@ -116,8 +416,20 @@ class RecommendationService:
         if not profile_dense:
             return []
         
+        if isinstance(profile_dense, list) and len(profile_dense) > 0:
+            if isinstance(profile_dense[0], list):
+                profile_dense = profile_dense[0]
+            elif isinstance(profile_dense[0], np.ndarray):
+                profile_dense = profile_dense[0].tolist()
+        
+        # Convert to numpy array để normalize
+        profile_dense = np.array(profile_dense, dtype=np.float32)
+        if len(profile_dense.shape) > 1:
+            # Nếu vẫn là 2D, flatten
+            profile_dense = profile_dense.flatten()
+        
         # Normalize to unit vector using numpy
-        profile_dense = self._normalize_vector(profile_dense)
+        profile_dense = self._normalize_vector(profile_dense.tolist())
         
         # Save to Milvus (long-term storage)
         user_id = user_profile.get("id")
@@ -155,6 +467,8 @@ class RecommendationService:
             try:
                 cached = self.redis_client.get(cache_key)
                 if cached:
+                    if isinstance(cached, (bytes, bytearray)):
+                        cached = cached.decode()
                     return json.loads(cached)
             except Exception as e:
                 print(f"Warning: Failed to read from Redis cache: {e}")
@@ -360,8 +674,20 @@ class RecommendationService:
     def _embed_text_to_dense(self, text: str) -> List[float]:
         """Embed text to dense vector using BGE-M3"""
         embeddings = self.milvus_service.generate_embeddings([text])
-        dense = embeddings["dense"] if embeddings else [[]]
-        return dense if dense else []
+        if not embeddings or "dense" not in embeddings:
+            return []
+        
+        dense = embeddings["dense"]
+        # generate_embeddings trả về list of lists, cần lấy phần tử đầu tiên
+        if isinstance(dense, list) and len(dense) > 0:
+            # Kiểm tra xem có phải nested list không
+            if isinstance(dense[0], list):
+                return list(dense[0])  # Lấy vector đầu tiên
+            elif isinstance(dense[0], np.ndarray):
+                return dense[0].tolist()
+            else:
+                return list(dense)  # Nếu đã là flat list
+        return []
 
     def _compute_behavior_dense(
         self, 
@@ -504,3 +830,206 @@ class RecommendationService:
             return math.exp(-math.log(2) * (delta_days / float(half_life_days)))
         except Exception:
             return 1.0
+
+    # --------------------------------------------------------------------- #
+    # Interaction Stream Consumer
+    # --------------------------------------------------------------------- #
+    
+    def _start_interaction_consumer(self):
+        """Khởi động consumer để xử lý interaction events từ Redis stream."""
+        if not self.redis_client:
+            print("Warning: Redis not available, skipping interaction stream consumer")
+            return
+        
+        def consume_loop():
+            while True:
+                try:
+                    self._process_interaction_stream()
+                    time.sleep(1)  # Poll mỗi 1 giây
+                except Exception as e:
+                    print(f"Error in interaction stream consumer: {e}")
+                    time.sleep(5)  # Đợi lâu hơn khi có lỗi
+        
+        thread = threading.Thread(target=consume_loop, daemon=True)
+        thread.start()
+        print("Interaction stream consumer started")
+    
+    def _process_interaction_stream(self):
+        """Xử lý messages từ interaction stream."""
+        if not self.redis_client:
+            return
+        
+        try:
+            # Đọc messages từ stream (non-blocking)
+            stream_name = Config.INTERACTION_STREAM_NAME
+            messages = self.redis_client.xread({stream_name: "$"}, count=10, block=1000)
+            
+            for stream, msgs in messages:
+                for msg_id, fields in msgs:
+                    try:
+                        self._handle_interaction_event(fields)
+                        # Acknowledge message
+                        self.redis_client.xack(stream_name, "recommend-service-group", msg_id)
+                    except Exception as e:
+                        print(f"Error processing interaction event {msg_id}: {e}")
+        except Exception as e:
+            # Stream chưa tồn tại hoặc lỗi khác
+            if "no such key" not in str(e).lower():
+                print(f"Warning: Interaction stream read error: {e}")
+    
+    def _handle_interaction_event(self, fields: Dict[str, bytes]):
+        """Xử lý một interaction event và update short-term vector."""
+        try:
+            # Parse fields (Redis stream trả về bytes)
+            event_data = {}
+            for key, value in fields.items():
+                key_str = key.decode() if isinstance(key, bytes) else key
+                value_str = value.decode() if isinstance(value, bytes) else value
+                
+                if key_str == "data":
+                    # Parse JSON data
+                    event_data = json.loads(value_str)
+                else:
+                    event_data[key_str] = value_str
+            
+            # Extract fields
+            account_id = event_data.get("accountId") or event_data.get("account_id")
+            job_id = event_data.get("jobId") or event_data.get("job_id")
+            event_type = event_data.get("eventType") or event_data.get("event_type")
+            occurred_at = event_data.get("occurredAt") or event_data.get("occurred_at")
+            
+            if not account_id or not job_id or not event_type:
+                return
+            
+            user_id = int(account_id)
+            job_id_int = int(job_id)
+            
+            # Update interactions cache
+            self._update_user_interactions_cache(
+                user_id=user_id,
+                job_id=job_id_int,
+                event_type=event_type,
+                timestamp=occurred_at
+            )
+            
+            # Invalidate short-term vector cache để force recompute
+            self.invalidate_short_term_cache(user_id)
+            
+        except Exception as e:
+            print(f"Error handling interaction event: {e}")
+    
+    def _update_user_interactions_cache(
+        self,
+        user_id: int,
+        job_id: int,
+        event_type: str,
+        timestamp: Any
+    ):
+        """Cập nhật interactions cache trong Redis."""
+        if not self.redis_client:
+            return
+        
+        try:
+            cache_key = f"user_interactions:{user_id}"
+            
+            # Lấy interactions hiện tại
+            interactions = defaultdict(dict)
+            cached = self.redis_client.get(cache_key)
+            if cached:
+                if isinstance(cached, (bytes, bytearray)):
+                    cached = cached.decode()
+                existing = json.loads(cached)
+                for key, value in existing.items():
+                    if isinstance(value, dict):
+                        interactions[key] = value
+                    elif isinstance(value, list):
+                        interactions[key] = {int(v): None for v in value}
+            
+            # Thêm interaction mới
+            event_type_upper = str(event_type).upper()
+            if event_type_upper in INTERACTION_WEIGHTS:
+                # Convert timestamp to float nếu cần
+                ts_value = None
+                if timestamp:
+                    try:
+                        if isinstance(timestamp, str):
+                            # Parse ISO format
+                            dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                            ts_value = dt.timestamp()
+                        else:
+                            ts_value = float(timestamp)
+                    except Exception:
+                        ts_value = datetime.now(timezone.utc).timestamp()
+                else:
+                    ts_value = datetime.now(timezone.utc).timestamp()
+                
+                interactions[event_type_upper][job_id] = ts_value
+            
+            # Lưu lại cache (TTL 7 ngày)
+            self.redis_client.setex(
+                cache_key,
+                7 * 24 * 3600,
+                json.dumps({k: dict(v) if isinstance(v, dict) else v for k, v in interactions.items()})
+            )
+            
+        except Exception as e:
+            print(f"Error updating user interactions cache: {e}")
+
+    # --------------------------------------------------------------------- #
+    # Các helper mặc định (cần override hoặc tích hợp thực tế)
+    # --------------------------------------------------------------------- #
+
+    def _get_user_profile(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Lấy user profile từ API hoặc Milvus.
+        
+        Nếu chưa có user vector trên Milvus, gọi API để lấy profile.
+        """
+        # Kiểm tra xem đã có user vector trên Milvus chưa
+        try:
+            user_vector = self.milvus_service.get_user_vector(user_id)
+            if user_vector:
+                # Đã có vector, không cần gọi API
+                return None
+        except Exception:
+            pass
+        
+        # Chưa có vector, gọi API lấy profile
+        try:
+            api_url = f"{Config.CANDIDATE_API_BASE_URL}/api/candidates/profile/{user_id}"
+            response = requests.get(api_url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("code") == 1000 and data.get("data"):
+                    profile_data = data["data"]
+                    # Chuẩn hóa format: educations -> education
+                    if "educations" in profile_data:
+                        profile_data["education"] = profile_data.pop("educations")
+                    return profile_data
+        except Exception as e:
+            print(f"Warning: Failed to fetch user profile from API: {e}")
+        
+        return None
+
+    def _get_user_interactions(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Lấy user interactions từ Redis cache (được update từ stream)."""
+        if not self.redis_client:
+            return {}
+        
+        try:
+            cache_key = f"user_interactions:{user_id}"
+            cached = self.redis_client.get(cache_key)
+            if cached:
+                if isinstance(cached, (bytes, bytearray)):
+                    cached = cached.decode()
+                return json.loads(cached)
+        except Exception as e:
+            print(f"Warning: Failed to get user interactions from cache: {e}")
+        
+        return {}
+
+    def _get_popular_jobs(
+        self,
+        limit: int
+    ) -> List[Dict[str, Any]]:
+        """Placeholder: trả về danh sách job phổ biến."""
+        return []

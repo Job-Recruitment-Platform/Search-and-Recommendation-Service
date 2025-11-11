@@ -31,13 +31,22 @@ class Config:
     SEARCH_DEFAULT_LIMIT: int = int(os.getenv("SEARCH_DEFAULT_LIMIT", "10"))
     SEARCH_DEFAULT_OFFSET: int = int(os.getenv("SEARCH_DEFAULT_OFFSET", "0"))
     SEARCH_THRESHOLD: float = float(os.getenv("SEARCH_THRESHOLD", "0.3"))
+    
+    # Recommendation configuration
+    CANDIDATE_API_BASE_URL: str = os.getenv("CANDIDATE_API_BASE_URL", "http://localhost:8080")
+    INTERACTION_STREAM_NAME: str = os.getenv("INTERACTION_STREAM_NAME", "INTERACTION_STREAM")
+    INTERACTION_HALF_LIFE_DAYS: float = float(os.getenv("INTERACTION_HALF_LIFE_DAYS", "30"))
+    
+    # CF model configuration
+    CF_MODEL_PATH: str = os.getenv("CF_MODEL_PATH", "CFModel/models/cf_model.pkl")
+
 
 
 INTERACTION_WEIGHTS = {
     # Positive signals
     'APPLY': 1.0, #Strongest positive signal
     "SAVE": 0.6,  # Medium weight for saving jobs
-    "CLICK": 0.3,  # Light weight for viewing jobs
+    # "CLICK" == "VIEW"
     "CLICK_FROM_SIMILAR": 0.2,  # Clicks from similar jobs section
     "CLICK_FROM_RECOMMENDED": 0.25,  # Clicks from recommended jobs section
     "CLICK_FROM_SEARCH": 0.4,  # Clicks from search results
