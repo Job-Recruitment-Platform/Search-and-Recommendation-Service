@@ -16,7 +16,7 @@ def ensure_model_downloaded():
     try:
         logger.info("⏳ Downloading BGE-M3 model (first run, ~2GB, may take 3-5 minutes)...")
         
-        # ✅ Correct API: BGEM3FlagModel() takes model_name_or_path as first positional arg
+        # Correct API: BGEM3FlagModel() takes model_name_or_path as first positional arg
         from FlagEmbedding import BGEM3FlagModel
         
         ef = BGEM3FlagModel(

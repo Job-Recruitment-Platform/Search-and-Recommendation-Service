@@ -19,14 +19,14 @@ RUN apt-get update && \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# ✅ Set environment to disable hash checking
+# Set environment to disable hash checking
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Upgrade pip
 RUN pip install --upgrade pip setuptools wheel
 
-# ✅ Install PyTorch CPU FIRST (required by BGE-M3)
+# Install PyTorch CPU FIRST (required by BGE-M3)
 RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 # Install core dependencies
@@ -49,7 +49,7 @@ RUN pip install \
 # Install pymilvus
 RUN pip install pymilvus==2.4.0
 
-# ✅ Install missing dependencies for pymilvus[model]
+# Install missing dependencies for pymilvus[model]
 RUN pip install \
     transformers \
     sentence-transformers \
@@ -60,7 +60,7 @@ RUN pip install \
 # Install pymilvus[model] - Includes BGE-M3 dependencies
 RUN pip install "pymilvus[model]==2.4.0"
 
-# ✅ Install FlagEmbedding explicitly
+# Install FlagEmbedding explicitly
 RUN pip install FlagEmbedding
 
 # ============================================
@@ -77,13 +77,13 @@ RUN apt-get update && \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# ✅ Create user FIRST (before copying files)
+# Create user FIRST (before copying files)
 RUN useradd -m -u 1000 appuser
 
 # Copy venv from builder
 COPY --from=builder /opt/venv /opt/venv
 
-# ✅ Create cache directories with correct ownership
+# Create cache directories with correct ownership
 RUN mkdir -p /home/appuser/.cache/huggingface/hub && \
     chown -R appuser:appuser /home/appuser/.cache
 
