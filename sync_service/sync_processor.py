@@ -1,4 +1,3 @@
-"""Sync processor for handling job updates from outbox events"""
 import logging
 import json
 from typing import Dict, Any

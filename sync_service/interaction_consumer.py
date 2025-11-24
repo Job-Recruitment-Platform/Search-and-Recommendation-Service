@@ -1,5 +1,5 @@
-"""Redis stream consumer for user-interactions (Recommendation signals)"""
 import logging
+import hashlib
 import redis
 import psycopg2
 import psycopg2.extras
@@ -81,7 +81,6 @@ class InteractionConsumer:
             conn = self._get_db_connection()
             cursor = conn.cursor()
 
-            import hashlib
             external_id = hashlib.md5(
                 f"{event.account_id}_{event.job_id}_{event.event_type.value}_{event.occurred_at}".encode()
             ).hexdigest()[:64]
