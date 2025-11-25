@@ -25,7 +25,7 @@ ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Upgrade pip
-RUN pip install --upgrade pip setuptools wheel
+RUN pip install --upgrade pip "setuptools<81" wheel
 
 # Install PyTorch CPU FIRST (required by BGE-M3)
 RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
