@@ -47,11 +47,12 @@ def create_routes(app: Flask, search_service: SearchService, recommend_service: 
             logger.exception("Search failed")
             return jsonify({"error": str(e)}), 500
 
-    @app.route("/recommend/<int:user_id>", methods=["GET"])
-    def recommend(user_id: int):
+    @app.route("/recommend", methods=["GET"])
+    def recommend():
         """Recommendation endpoint (hybrid CF + content-based với exploration)."""
         try:
             top_k = int(request.args.get("top_k", 20))
+            user_id = int(request.args.get("user_id", 0))
             
             recommendations = recommend_service.recommend(
                 user_id=user_id,
