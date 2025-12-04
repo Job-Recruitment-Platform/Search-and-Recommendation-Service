@@ -8,10 +8,6 @@ from pymilvus import (
     DataType,
     Collection,
     utility,
-    AnnSearchRequest,
-    WeightedRanker,
-    Function,
-    FunctionType,
 )
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 from app.config import Config
@@ -23,12 +19,14 @@ jobs_collection_schema = {
     "name": "jobs",
     "description": "Jobs collection",
     "fields": [
-        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
+        FieldSchema(name="id", dtype=DataType.INT64,
+                    is_primary=True, auto_id=False),
         # Basic job info fields for search
         FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=100),
         FieldSchema(name="skills", dtype=DataType.VARCHAR, max_length=1000),
         FieldSchema(name="location", dtype=DataType.VARCHAR, max_length=100),
-        FieldSchema(name="description", dtype=DataType.VARCHAR, max_length=3000),        
+        FieldSchema(name="description",
+                    dtype=DataType.VARCHAR, max_length=3000),
         # Filterable fields
         FieldSchema(name="company", dtype=DataType.VARCHAR, max_length=100),
         FieldSchema(name="job_role", dtype=DataType.VARCHAR, max_length=100),
@@ -39,14 +37,15 @@ jobs_collection_schema = {
         FieldSchema(name="salary_max", dtype=DataType.INT32),
         FieldSchema(name="currency", dtype=DataType.VARCHAR, max_length=10),
         FieldSchema(name="status", dtype=DataType.VARCHAR, max_length=20),
-        
+
         # Other metadata fields
         FieldSchema(name="max_candidates", dtype=DataType.INT32),
         FieldSchema(name="date_posted", dtype=DataType.INT64),
         FieldSchema(name="date_expires", dtype=DataType.INT64),
-        
+
         # Vector fields
-        FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=1024),
+        FieldSchema(name="dense_vector",
+                    dtype=DataType.FLOAT_VECTOR, dim=1024),
         FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
     ],
     "indexes": [
@@ -72,8 +71,10 @@ users_collection_schema = {
     "name": "users",
     "description": "Users collection",
     "fields": [
-        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
-        FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=1024),
+        FieldSchema(name="id", dtype=DataType.INT64,
+                    is_primary=True, auto_id=False),
+        FieldSchema(name="dense_vector",
+                    dtype=DataType.FLOAT_VECTOR, dim=1024),
     ],
     "indexes": [
         {
@@ -86,7 +87,6 @@ users_collection_schema = {
         },
     ],
 }
-
 
 
 class MilvusService:
@@ -102,7 +102,8 @@ class MilvusService:
     def _setup(self):
         """Setup Milvus connection and collection"""
         try:
-            connections.connect(host=Config.MILVUS_HOST, port=Config.MILVUS_PORT)
+            connections.connect(host=Config.MILVUS_HOST,
+                                port=Config.MILVUS_PORT)
             logger.info(
                 f"Connected to Milvus at {Config.MILVUS_HOST}:{Config.MILVUS_PORT}"
             )
@@ -112,14 +113,15 @@ class MilvusService:
                 model_name=Config.EMBEDDING_MODEL_NAME,
                 device=Config.EMBEDDING_DEVICE,
                 use_fp16=Config.EMBEDDING_USE_FP16,
-                return_dense=True,
-                return_sparse=True,
             )
             self.dense_dim = self.ef.dim["dense"]
             logger.info("Initialized BGEM3 embedding function")
+
             # Setup collection
-            self.jobs_collection = self._setup_collection(jobs_collection_schema)
-            self.users_collection = self._setup_collection(users_collection_schema)
+            self.jobs_collection = self._setup_collection(
+                jobs_collection_schema)
+            self.users_collection = self._setup_collection(
+                users_collection_schema)
 
         except Exception as e:
             logger.error(f"Failed to connect to Milvus: {e}")
@@ -152,19 +154,47 @@ class MilvusService:
         collection.load()
         logger.info(f"Loaded collection: {collection_name}")
         return collection
-    
+
     def generate_embeddings(self, texts: List[str]) -> Dict[str, object]:
         """Generate dense and sparse embeddings for given texts"""
         try:
             embeddings = self.ef.encode_documents(texts)
 
+            # Handle sparse embeddings properly
+            sparse_embeddings = []
+            sparse_result = embeddings.get("sparse")
+
+            # Check if sparse_result is a single matrix or list of matrices
+            if hasattr(sparse_result, "tocoo"):
+                # Single sparse matrix - convert to list
+                sparse_matrices = [sparse_result]
+            else:
+                # Already a list
+                sparse_matrices = sparse_result
+
+            # Convert each sparse matrix to dict format for Milvus
+            for sparse_matrix in sparse_matrices:
+                if hasattr(sparse_matrix, "tocoo"):
+                    # Convert scipy sparse matrix to dict {index: value}
+                    coo = sparse_matrix.tocoo()
+                    sparse_dict = {int(col): float(data)
+                                   for col, data in zip(coo.col, coo.data)}
+                    sparse_embeddings.append(sparse_dict)
+                elif isinstance(sparse_matrix, dict):
+                    # Already in dict format
+                    sparse_embeddings.append(sparse_matrix)
+                else:
+                    logger.warning(
+                        f"Unknown sparse format: {type(sparse_matrix)}")
+                    sparse_embeddings.append({})
+
             return {
                 "dense": embeddings["dense"],
-                "sparse": embeddings["sparse"],
+                "sparse": sparse_embeddings,
             }
 
         except Exception as e:
-            logger.error(f"Embedding generation failed: {e}")
+            logger.error(f"Embedding generation failed: {e}", exc_info=True)
             raise
 
     def get_job_dense_vector(self, job_id: int) -> List[float]:
@@ -178,7 +208,8 @@ class MilvusService:
             if results and isinstance(results, list) and "dense_vector" in results[0]:
                 return list(results[0]["dense_vector"])  # type: ignore
         except Exception as e:
-            logger.warning(f"Failed to fetch dense vector for job {job_id}: {e}")
+            logger.warning(
+                f"Failed to fetch dense vector for job {job_id}: {e}")
         return []
 
     def upsert_user_vector(self, user_id: int, dense_vector: List[float]) -> None:
@@ -196,7 +227,7 @@ class MilvusService:
         except Exception as e:
             logger.error(f"Failed to upsert user vector for {user_id}: {e}")
             raise
-    
+
     def get_user_vector(self, user_id: int) -> Optional[List[float]]:
         """Get user vector from Milvus collection"""
         try:
@@ -218,9 +249,9 @@ class MilvusService:
         try:
             if not entities:
                 raise ValueError("No jobs to upsert")
-            
+
             self.delete_jobs([entity["id"] for entity in entities])
-            
+
             self.jobs_collection.insert(entities)
             logger.info(f"Inserted {len(entities)} jobs into Milvus")
             return len(entities)
@@ -241,4 +272,3 @@ class MilvusService:
         except Exception as e:
             logger.warning(f"Delete failed: {e}")
             return 0
-

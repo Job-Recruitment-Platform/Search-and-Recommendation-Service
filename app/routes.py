@@ -75,3 +75,16 @@ def create_routes(app: Flask, search_service: SearchService, recommend_service: 
                 "error": str(e)
             }), 500
 
+    @app.route("/internal/reload-model", methods=["POST"])
+    def reload_model():
+        token = request.headers.get("X-Internal-Token")
+        expected_token = getattr(Config, "INTERNAL_API_TOKEN", None)
+        
+        if expected_token and token != expected_token:
+             return jsonify({"error": "Unauthorized"}), 403
+        
+        success = recommend_service.reload_model()
+        if success:
+            return jsonify({"status": "success", "message": "Model reloaded"}), 200
+        else:
+            return jsonify({"status": "error", "message": "Failed to reload model"}), 500

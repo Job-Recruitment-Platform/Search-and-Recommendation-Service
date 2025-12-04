@@ -1,5 +1,7 @@
+version: '3.8'
+
 networks:
-  milvus-system-network:
+  bot-cv-network:
     driver: bridge
 
 volumes:
@@ -10,27 +12,29 @@ volumes:
 
 
 services:
-  # Lưu metadata (schema + index info)
+  # ============================================
+  # Infrastructure
+  # ============================================
+
   etcd:
     image: quay.io/coreos/etcd:v3.5.9
     container_name: etcd
     command: >
-      etcd
-      --advertise-client-urls=http://0.0.0.0:2379
-      --listen-client-urls=http://0.0.0.0:2379
-      --data-dir=/etcd-data
-      --auto-compaction-mode=revision
-      --auto-compaction-retention=1000
-      --quota-backend-bytes=4294967296
+      etcd --advertise-client-urls=http://0.0.0.0:2379 --listen-client-urls=http://0.0.0.0:2379 --data-dir=/etcd-data --auto-compaction-mode=revision --auto-compaction-retention=1000 --quota-backend-bytes=4294967296
     ports:
       - "2379:2379"
     volumes:
       - etcd-data:/etcd-data
-    restart: unless-stopped
-    networks: [milvus-system-network]
+    networks:
+      - bot-cv-network
     healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://0.0.0.0:2379"]
-  # Object storage (segment file của milvus)
+      test: [ "CMD", "etcdctl", "endpoint", "health", "--endpoints=http://0.0.0.0:2379" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
   minio:
     image: minio/minio:RELEASE.2024-03-15T01-07-19Z
     container_name: minio
@@ -39,31 +43,131 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # MinIO console
+      - "9000:9000"
+      - "9001:9001"
     volumes:
       - minio-data:/data
+    networks:
+      - bot-cv-network
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
-    networks: [milvus-system-network]
 
-  # Milvus standalone
+  redis:
+    image: redis:7-alpine
+    container_name: bot-cv-redis
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - bot-cv-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ============================================
+  # Vector Database
+  # ============================================
+
   milvus:
     image: milvusdb/milvus:v2.4.8
     container_name: milvus
-    command: ["milvus", "run", "standalone"]
+    command: [ "milvus", "run", "standalone" ]
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
       MINIO_USE_SSL: "false"
       MILVUS_LOG_LEVEL: info
     depends_on:
-      - etcd
-      - minio
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     ports:
-      - "19530:19530" # Milvus gRPC/HTTP
+      - "19530:19530"
+      - "9091:9091"
     volumes:
       - milvus-data:/var/lib/milvus
+    networks:
+      - bot-cv-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9091/healthz" ]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 90s
     restart: unless-stopped
-    networks: [milvus-system-network]
+
+  # ============================================
+  # Application
+  # ============================================
+
+  search-and-recommend-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+    image: bot-cv-recommend:latest
+    container_name: recommend-service
+    ports:
+      - "8000:8000"
+    environment:
+      FLASK_DEBUG: "false"
+      MILVUS_HOST: milvus
+      MILVUS_PORT: 19530
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_STREAM_NAME: outbox-events
+      REDIS_CONSUMER_GROUP: milvus-sync
+      REDIS_CONSUMER_NAME: worker-1
+      INTERACTION_STREAM_NAME: outbox-events
+      INTERACTION_CONSUMER_GROUP: recommend-service-group
+      INTERACTION_HALF_LIFE_DAYS: 30
+      EMBEDDING_MODEL_NAME: BAAI/bge-m3
+      EMBEDDING_DEVICE: cpu
+      EMBEDDING_USE_FP16: "false"
+      SEARCH_DEFAULT_LIMIT: 10
+      SEARCH_DEFAULT_OFFSET: 0
+      SEARCH_THRESHOLD: 0.3
+      CANDIDATE_API_BASE_URL: http://backend:8080
+      CF_MODEL_PATH: /app/CFModel/models/cf_model.pkl
+    volumes:
+      - ./CFModel/models:/app/CFModel/models:ro
+      # - ./app:/app/app
+      # - ./services:/app/services
+    depends_on:
+      milvus:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - bot-cv-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    restart: unless-stopped
