@@ -1,5 +1,3 @@
-# Multi-stage build - Optimized to reduce layer size
-
 # ============================================
 # Stage 1: Builder
 # ============================================
@@ -7,65 +5,34 @@ FROM python:3.11-slim-bookworm AS builder
 
 WORKDIR /app
 
-# Install minimal build dependencies
+# Install build dependencies
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     git \
-    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Create venv
+# Create virtual environment
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Set environment to disable hash checking
+# Optimize pip
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Upgrade pip
+# Upgrade pip and setuptools
 RUN pip install --upgrade pip "setuptools<81" wheel
 
-# Install PyTorch CPU FIRST (required by BGE-M3)
+# Install PyTorch CPU (required by embeddings)
 RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-# Install core dependencies
-RUN pip install \
-    Flask==3.0.0 \
-    redis==5.0.1 \
-    numpy==1.26.2 \
-    python-dotenv==1.0.0 \
-    scipy==1.11.4 \
-    requests==2.31.0 \
-    schedule==1.2.0 \
-    psycopg2-binary==2.9.9 \
-    implicit==0.7.2
+# Install dependencies from requirements.txt
+COPY requirements.txt .
+RUN pip install -r requirements.txt
 
-# Install pymilvus dependencies
-RUN pip install \
-    marshmallow==3.20.1 \
-    marshmallow-enum==1.5.1 \
-    environs==9.5.0 \
-    grpcio==1.60.0 \
-    protobuf==3.20.0
-
-# Install pymilvus
-RUN pip install pymilvus==2.4.0
-
-# Install missing dependencies for pymilvus[model]
-RUN pip install \
-    transformers \
-    sentence-transformers \
-    datasets \
-    huggingface-hub \
-    tokenizers
-
-# Install pymilvus[model] - Includes BGE-M3 dependencies
-RUN pip install "pymilvus[model]==2.4.0"
-
-# Install FlagEmbedding explicitly
-RUN pip install FlagEmbedding
+# Install milvus-model explicitly (sometimes missed by requirements.txt)
+RUN pip install milvus-model>=0.2.0
 
 # ============================================
 # Stage 2: Runtime
@@ -74,66 +41,88 @@ FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Install minimal runtime dependencies
+# Install runtime dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
-    libpq5 \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Create user FIRST (before copying files)
+# Create non-root user
 RUN useradd -m -u 1000 appuser
 
-# Copy venv from builder
+# Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 
-# Create cache directories with correct ownership
+# Create cache directories
 RUN mkdir -p /home/appuser/.cache/huggingface/hub && \
     chown -R appuser:appuser /home/appuser/.cache
 
-# Set environment
+# Set environment variables
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    \
+    # Flask config
     FLASK_HOST=0.0.0.0 \
     FLASK_PORT=8000 \
     FLASK_DEBUG=false \
+    \
+    # Milvus config
     MILVUS_HOST=milvus \
     MILVUS_PORT=19530 \
+    \
+    # Redis config
     REDIS_HOST=redis \
     REDIS_PORT=6379 \
     REDIS_DB=0 \
-    REDIS_STREAM_NAME=outbox-events \
-    REDIS_CONSUMER_GROUP=milvus-sync \
-    REDIS_CONSUMER_NAME=worker-1 \
-    INTERACTION_STREAM_NAME=outbox-events \
+    \
+    # Stream config (Outbox events for Job sync)
+    OUTBOX_STREAM_NAME=outbox-events \
+    OUTBOX_CONSUMER_GROUP=outbox-processor-group \
+    OUTBOX_CONSUMER_NAME=python-sync-worker-1 \
+    \
+    # Stream config (User interactions for recommendations)
+    INTERACTION_STREAM_NAME=user-interactions \
     INTERACTION_CONSUMER_GROUP=recommend-service-group \
-    INTERACTION_HALF_LIFE_DAYS=30 \
+    INTERACTION_CONSUMER_NAME=python-recommend-worker-1 \
+    \
+    # Embedding model config
     EMBEDDING_MODEL_NAME=BAAI/bge-m3 \
     EMBEDDING_DEVICE=cpu \
     EMBEDDING_USE_FP16=false \
+    \
+    # Search config
     SEARCH_DEFAULT_LIMIT=10 \
     SEARCH_DEFAULT_OFFSET=0 \
     SEARCH_THRESHOLD=0.3 \
+    \
+    # Recommendation config
     CANDIDATE_API_BASE_URL=http://backend:8080 \
+    INTERACTION_HALF_LIFE_DAYS=30 \
     CF_MODEL_PATH=/app/CFModel/models/cf_model.pkl \
+    \
+    # Hugging Face cache
     HF_HOME=/home/appuser/.cache/huggingface \
     TRANSFORMERS_CACHE=/home/appuser/.cache/huggingface/hub
 
 # Copy application code
 COPY --chown=appuser:appuser . .
 
-# Create app directories with correct ownership
+# Create data and model directories
 RUN mkdir -p /app/data /app/CFModel/models && \
     chown -R appuser:appuser /app
 
+# Switch to non-root user
 USER appuser
 
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=360s --retries=10 \
     CMD curl -f http://localhost:8000/health || exit 1
 
+# Expose port
 EXPOSE 8000
 
+# Run Flask app with 2 consumer threads
 CMD ["python", "main.py"]

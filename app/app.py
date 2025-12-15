@@ -22,14 +22,14 @@ def create_app() -> Flask:
         milvus_service = MilvusService()
         search_service = SearchService(milvus_service)
         recommend_service = RecommendationService(milvus_service)
-        logger.info("✓ Services initialized successfully")
+        logger.info("Services initialized successfully")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize services: {e}", exc_info=True)
+        logger.error(f"Failed to initialize services: {e}", exc_info=True)
         raise
 
     # Register routes
     create_routes(app, search_service, recommend_service)
-    logger.info("✓ Routes registered")
+    logger.info("Routes registered")
 
     # ============================================
     # Start Consumer Thread 1: Outbox Events
@@ -40,14 +40,14 @@ def create_app() -> Flask:
             logger.info("Starting Outbox Event Consumer thread...")
             consumer = OutboxEventConsumer()
             logger.info(
-                "✓ Outbox consumer initialized, processing messages...")
+                "Outbox consumer initialized, processing messages...")
             consumer.run()
         except KeyboardInterrupt:
-            logger.info("⚠️  Outbox consumer interrupted by user")
+            logger.info("Outbox consumer interrupted by user")
         except Exception as e:
-            logger.error(f"❌ Outbox consumer error: {e}", exc_info=True)
+            logger.error(f"Outbox consumer error: {e}", exc_info=True)
             logger.warning(
-                "⚠️  Outbox consumer stopped, but Flask app continues")
+                "Outbox consumer stopped, but Flask app continues")
 
     outbox_thread = threading.Thread(
         target=start_outbox_consumer,
@@ -55,7 +55,7 @@ def create_app() -> Flask:
         name="OutboxEventConsumer"
     )
     outbox_thread.start()
-    logger.info("✓ Outbox Event Consumer thread started")
+    logger.info("Outbox Event Consumer thread started")
 
     # ============================================
     # Start Consumer Thread 2: User Interactions
@@ -66,14 +66,14 @@ def create_app() -> Flask:
             logger.info("Starting Interaction Consumer thread...")
             consumer = InteractionConsumer()
             logger.info(
-                "✓ Interaction consumer initialized, processing messages...")
+                "Interaction consumer initialized, processing messages...")
             consumer.run()
         except KeyboardInterrupt:
-            logger.info("⚠️  Interaction consumer interrupted by user")
+            logger.info("Interaction consumer interrupted by user")
         except Exception as e:
-            logger.error(f"❌ Interaction consumer error: {e}", exc_info=True)
+            logger.error(f"Interaction consumer error: {e}", exc_info=True)
             logger.warning(
-                "⚠️  Interaction consumer stopped, but Flask app continues")
+                "Interaction consumer stopped, but Flask app continues")
 
     interaction_thread = threading.Thread(
         target=start_interaction_consumer,
@@ -81,8 +81,8 @@ def create_app() -> Flask:
         name="InteractionConsumer"
     )
     interaction_thread.start()
-    logger.info("✓ Interaction Consumer thread started")
+    logger.info("Interaction Consumer thread started")
 
     logger.info(
-        "✓ Flask application created successfully with 2 consumer threads")
+        "Flask application created successfully with 2 consumer threads")
     return app

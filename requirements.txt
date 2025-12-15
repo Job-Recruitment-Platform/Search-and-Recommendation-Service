@@ -1,21 +1,38 @@
+# Core Flask
 Flask==3.0.0
+
+# Redis
 redis==5.0.1
+
+# Scientific computing
 numpy==1.26.2
-python-dotenv==1.0.0
-pymilvus==2.4.0
 scipy==1.11.4
-requests==2.31.0
-marshmallow==3.20.1
-marshmallow-enum==1.5.1
-environs==9.5.0
+pandas>=2.0.0
+
+# Milvus vector database
+pymilvus==2.4.0
+milvus-model>=0.2.0
 grpcio==1.60.0
 protobuf==3.20.0
+
+# Serialization
+marshmallow==3.20.1
+marshmallow-enum==1.5.1
+
+# Configuration
+python-dotenv==1.0.0
+environs==9.5.0
+
+# HTTP client
+requests==2.31.0
+
+# Embeddings
 transformers
 sentence-transformers
 datasets
 huggingface-hub
 tokenizers
 FlagEmbedding
-psycopg2-binary>=2.9.9
+
+# Collaborative Filtering
 implicit>=0.7.2
-schedule==1.2.1

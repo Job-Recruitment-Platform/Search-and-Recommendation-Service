@@ -1,18 +1,15 @@
 import logging
-import hashlib
+import json
 import redis
-import psycopg2
-import psycopg2.extras
-from typing import Optional
-from datetime import datetime
-from app.config import Config
+from datetime import datetime, timezone
+from collections import defaultdict
+from app.config import Config, INTERACTION_WEIGHTS
 from models.event import InteractionEvent
 
 logger = logging.getLogger(__name__)
 
-
 class InteractionConsumer:
-    """Consumer for 'user-interactions' stream - Stores interactions for CF model"""
+    """Consumer for 'user-interactions' stream"""
 
     def __init__(self):
         self.redis_client = redis.Redis(
@@ -21,9 +18,12 @@ class InteractionConsumer:
             db=Config.REDIS_DB,
             decode_responses=True,
         )
-        self.stream_name = "user-interactions"
-        self.consumer_group = "recommend-service-group"
-        self.consumer_name = "python-recommend-worker-1"
+        self.stream_name = Config.INTERACTION_STREAM_NAME
+        self.consumer_group = Config.INTERACTION_CONSUMER_GROUP
+        self.consumer_name = Config.INTERACTION_CONSUMER_NAME
+
+        # CSV storage for training data
+        self.csv_storage = InteractionStorage("data/interactions.csv")
 
         self.running = False
         self._setup_consumer_group()
@@ -34,12 +34,11 @@ class InteractionConsumer:
             try:
                 stream_info = self.redis_client.xinfo_stream(self.stream_name)
                 logger.info(
-                    f"✓ Stream '{self.stream_name}' exists with {stream_info.get('length', 0)} messages"
+                    f"Stream '{self.stream_name}' exists with {stream_info.get('length', 0)} messages"
                 )
             except redis.exceptions.ResponseError:
                 logger.warning(
-                    f"⚠️  Stream '{self.stream_name}' does not exist yet"
-                )
+                    f"Stream '{self.stream_name}' does not exist yet")
 
             self.redis_client.xgroup_create(
                 name=self.stream_name,
@@ -47,77 +46,89 @@ class InteractionConsumer:
                 id="0",
                 mkstream=True,
             )
-            logger.info(
-                f"✓ Created consumer group '{self.consumer_group}' for stream '{self.stream_name}'"
-            )
+            logger.info(f"Created consumer group '{self.consumer_group}'")
         except redis.exceptions.ResponseError as e:
             if "BUSYGROUP" in str(e):
                 logger.info(
-                    f"✓ Consumer group '{self.consumer_group}' already exists"
-                )
+                    f"Consumer group '{self.consumer_group}' already exists")
             else:
-                logger.error(f"❌ Failed to create consumer group: {e}")
+                logger.error(f"Failed to create consumer group: {e}")
                 raise
 
-    def _get_db_connection(self):
-        """Get PostgreSQL connection"""
+    def _update_redis_cache(self, event: InteractionEvent) -> bool:
         try:
-            conn = psycopg2.connect(
-                host=Config.POSTGRES_HOST,
-                port=Config.POSTGRES_PORT,
-                database=Config.POSTGRES_DB,
-                user=Config.POSTGRES_USERNAME,
-                password=Config.POSTGRES_PASSWORD
+            cache_key = f"user_interactions:{event.account_id}"
+
+            # Parse timestamp
+            timestamp = datetime.fromisoformat(
+                event.occurred_at.replace('Z', '+00:00')
+            ).timestamp()
+
+            # Get existing interactions
+            interactions = defaultdict(dict)
+            cached = self.redis_client.get(cache_key)
+            if cached:
+                try:
+                    existing = json.loads(cached)
+                    for key, value in existing.items():
+                        if isinstance(value, dict):
+                            interactions[key] = value
+                        elif isinstance(value, list):
+                            # Convert old list format to dict
+                            interactions[key] = {int(v): None for v in value}
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"Invalid JSON in cache for user {event.account_id}")
+
+            # Add new interaction
+            event_type_upper = event.event_type.value.upper()
+            if event_type_upper in INTERACTION_WEIGHTS:
+                interactions[event_type_upper][event.job_id] = timestamp
+
+            # Save back to Redis (TTL 30 days, same as recommend.py uses 7 days)
+            self.redis_client.setex(
+                cache_key,
+                30 * 24 * 3600,  # 30 days
+                json.dumps({k: dict(v) for k, v in interactions.items()})
             )
-            return conn
-        except Exception as e:
-            logger.error(f"Failed to connect to database: {e}")
-            raise
 
-    def _save_interaction(self, event: InteractionEvent) -> bool:
-        """Save interaction to database (for CF model training)"""
-        conn = None
-        try:
-            conn = self._get_db_connection()
-            cursor = conn.cursor()
+            # Invalidate user's short-term vector cache
+            vector_cache_key = f"user_vector:short_term:{event.account_id}"
+            self.redis_client.delete(vector_cache_key)
 
-            external_id = hashlib.md5(
-                f"{event.account_id}_{event.job_id}_{event.event_type.value}_{event.occurred_at}".encode()
-            ).hexdigest()[:64]
-
-            # Insert into user_interactions table
-            query = """
-                INSERT INTO user_interactions 
-                (account_id, job_id, event_type, occurred_at, metadata, external_id)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (external_id) 
-                DO NOTHING
-            """
-
-            cursor.execute(query, (
-                event.account_id,
-                event.job_id,
-                event.event_type.value,
-                event.occurred_at,
-                psycopg2.extras.Json(
-                    event.metadata) if event.metadata else None,
-                external_id
-            ))
-
-            conn.commit()
-            rows_inserted = cursor.rowcount
-            cursor.close()
-
-            return rows_inserted > 0
+            logger.debug(
+                f"Cached: user={event.account_id}, job={event.job_id}, "
+                f"type={event_type_upper}"
+            )
+            return True
 
         except Exception as e:
-            logger.error(f"Failed to save interaction: {e}")
-            if conn:
-                conn.rollback()
+            logger.error(f"Failed to update Redis cache: {e}", exc_info=True)
             return False
-        finally:
-            if conn:
-                conn.close()
+
+    def _save_to_csv(self, event: InteractionEvent) -> bool:
+        """Save interaction to CSV for offline training"""
+        try:
+            timestamp = datetime.fromisoformat(
+                event.occurred_at.replace('Z', '+00:00')
+            ).timestamp()
+
+            self.csv_storage.append_interaction(
+                user_id=event.account_id,
+                job_id=event.job_id,
+                interaction_type=event.event_type.value,
+                timestamp=int(timestamp)
+            )
+
+            logger.debug(
+                f"CSV: user={event.account_id}, job={event.job_id}, "
+                f"type={event.event_type.value}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to save to CSV: {e}", exc_info=True)
+            return False
 
     def process_messages(self, count: int = 10, block: int = 5000):
         """Read and process messages from user-interactions stream"""
@@ -137,37 +148,48 @@ class InteractionConsumer:
             for stream, message_list in messages:
                 for message_id, fields in message_list:
                     try:
-                        logger.debug(f"📨 Processing interaction: {message_id}")
-
                         # Parse interaction event
                         event = InteractionEvent.from_redis_fields(fields)
 
                         logger.info(
-                            f"👤 User {event.account_id} -> Job {event.job_id}: "
+                            f"User {event.account_id} → Job {event.job_id}: "
                             f"{event.event_type.value} (weight={event.get_weight()})"
                         )
 
-                        # Save to database
-                        saved = self._save_interaction(event)
+                        # Task 1: Cache in Redis (same format as recommend.py)
+                        cached = self._update_redis_cache(event)
 
-                        if saved:
-                            logger.debug(
-                                f"✅ Saved interaction {message_id} to database")
+                        # Task 2: Save to CSV (for training)
+                        saved_csv = self._save_to_csv(event)
+
+                        # Log results
+                        if cached and saved_csv:
+                            logger.debug(f"{message_id}: cached + CSV")
+                        elif cached:
+                            logger.warning(
+                                f"{message_id}: cached but CSV failed")
+                        elif saved_csv:
+                            logger.warning(
+                                f"{message_id}: CSV but cache failed")
                         else:
-                            logger.debug(
-                                f"⏭️  Skipped duplicate interaction {message_id}")
+                            logger.error(f"{message_id}: both failed")
 
                         # ACK message
                         self.redis_client.xack(
-                            self.stream_name, self.consumer_group, message_id)
+                            self.stream_name, self.consumer_group, message_id
+                        )
                         processed_count += 1
 
                     except Exception as e:
                         logger.exception(
-                            f"❌ Error processing {message_id}: {e}")
+                            f"Error processing {message_id}: {e}")
                         # Still ACK to avoid infinite retries
                         self.redis_client.xack(
-                            self.stream_name, self.consumer_group, message_id)
+                            self.stream_name, self.consumer_group, message_id
+                        )
+
+            if processed_count > 0:
+                logger.info(f"Processed {processed_count} interactions")
 
             return processed_count
 
@@ -181,35 +203,36 @@ class InteractionConsumer:
     def run(self):
         """Run consumer continuously"""
         self.running = True
-        logger.info(
-            f"🚀 Starting Interaction Consumer (stream: {self.stream_name})...")
+        logger.info("=" * 70)
+        logger.info("Interaction Consumer Started")
+        logger.info("=" * 70)
+        logger.info(f"   Stream:    {self.stream_name}")
+        logger.info(f"   Group:     {self.consumer_group}")
+        logger.info(f"   CSV File:  {self.csv_storage.file_path}")
+        logger.info("=" * 70)
 
         retry_count = 0
         max_retries = 5
 
         while self.running:
             try:
-                processed = self.process_messages()
-                if processed > 0:
-                    logger.info(f"✅ Processed {processed} interactions")
+                self.process_messages()
                 retry_count = 0
-
             except KeyboardInterrupt:
-                logger.info("⚠️  Consumer interrupted by user")
+                logger.info("Consumer interrupted by user")
                 break
-
             except Exception as e:
                 retry_count += 1
                 logger.error(
-                    f"❌ Consumer error (retry {retry_count}/{max_retries}): {e}"
+                    f"Consumer error (retry {retry_count}/{max_retries}): {e}"
                 )
                 if retry_count >= max_retries:
-                    logger.error("❌ Max retries reached. Stopping consumer.")
+                    logger.error("Max retries reached. Stopping.")
                     break
                 import time
                 time.sleep(5 * retry_count)
 
-        logger.info("Consumer stopped")
+        logger.info("Interaction Consumer stopped")
 
     def stop(self):
         """Stop consumer"""
