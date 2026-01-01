@@ -14,12 +14,12 @@ logger = logging.getLogger(__name__)
 if __name__ == "__main__":
     # Download BGE-M3 model if needed (first run)
     logger.info("=== Starting Search and Recommendation Service ===")
-    try:
-        from init_model import ensure_model_downloaded
-        ensure_model_downloaded()
-    except Exception as e:
-        logger.warning(f"Model pre-download failed: {e}")
-        logger.warning("Will retry when Milvus service initializes...")
+    # try:
+    #     from init_model import ensure_model_downloaded
+    #     ensure_model_downloaded()
+    # except Exception as e:
+    #     logger.warning(f"Model pre-download failed: {e}")
+    #     logger.warning("Will retry when Milvus service initializes...")
     
     # Create and run Flask app
     logger.info("Creating Flask application...")

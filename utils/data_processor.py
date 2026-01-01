@@ -13,7 +13,7 @@ class DataProcessor:
         """Basic text cleaning"""
         if not text:
             return ""
-        return " ".join(text.strip().split())
+        return " ".join(text.strip().lower().split())
 
     @staticmethod
     def extract_skill_names(skills: Any) -> str:
@@ -35,10 +35,10 @@ class DataProcessor:
                 if isinstance(skill, dict):
                     name = skill.get("name")
                     if name:
-                        skill_names.append(str(name))
+                        skill_names.append(str(name).lower())
         else:
             # Array of strings: convert to list
-            skill_names = [str(skill) for skill in skills if skill]
+            skill_names = [str(skill).lower() for skill in skills if skill]
         
         # Join with comma and space, return as VARCHAR string
         return ", ".join(skill_names)

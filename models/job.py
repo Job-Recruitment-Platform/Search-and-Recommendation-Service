@@ -125,7 +125,7 @@ class Job:
             salary_min=int(data.get("salary_min") or data.get("salaryMin", 0)),
             salary_max=int(data.get("salary_max") or data.get("salaryMax", 0)),
             max_candidates=int(
-                data.get("max_candidates") or data.get("maxCandidates", 0)
+                data.get("max_candidates") or data.get("maxCandidates", 0) or 0
             ),
             date_posted=date_posted,
             date_expires=date_expires,
@@ -181,6 +181,7 @@ class Job:
                 "company": self.company,
                 "jobRole": self.job_role,
                 "seniority": self.seniority,
+                "description": self.description,
                 "location": self.location,
                 "workMode": self.work_mode,
                 "currency": self.currency,
@@ -201,6 +202,7 @@ class Job:
                 "job_role": self.job_role,
                 "seniority": self.seniority,
                 "location": self.location,
+                "description": self.description,
                 "work_mode": self.work_mode,
                 "currency": self.currency,
                 "status": self.status,
