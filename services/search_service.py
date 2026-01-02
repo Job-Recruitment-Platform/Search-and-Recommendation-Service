@@ -144,15 +144,16 @@ class SearchService:
         return job_ids, pagination
 
     def _build_filter_expression(self, filters: Optional[Dict[str, Any]]) -> Optional[str]:
-        if not filters:
-            return "status == 'published'"
-
         conditions = []
 
         # Status filter: default to published if not specified
+        # Only add if filters dict exists OR use default
+        if filters is None:
+            return "status == 'published'"
+        
         status = filters.get("status", "published")
         if status:
-            status_escaped = str(status).replace("'", "\\'")
+            status_escaped = str(status).lower().replace("'", "\\'")
             conditions.append(f"status == '{status_escaped}'")
 
         string_fields = {
@@ -165,12 +166,12 @@ class SearchService:
 
         for filter_key, field_name in string_fields.items():
             if filter_key in filters and filters[filter_key]:
-                value = str(filters[filter_key]).replace("'", "\\'")
+                value = str(filters[filter_key]).lower().replace("'", "\\'")
                 conditions.append(f"{field_name} == '{value}'")
 
         # Location filter: use LIKE for partial match (contains)
         if "location" in filters and filters["location"]:
-            location_value = str(filters["location"]).replace("'", "\\'")
+            location_value = str(filters["location"]).lower().replace("'", "\\'")
             conditions.append(f"location like '%{location_value}%'")
 
         # salaryMin: greater than or equal
@@ -205,20 +206,20 @@ class SearchService:
                 # Exact match (timestamp in milliseconds)
                 conditions.append(f"date_posted == {int(date_posted)}")
 
-        # dateExpires: filter for non-expired jobs (default behavior)
-        if filters.get("excludeExpired", True):
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            conditions.append(
-                f"(date_expires == 0 || date_expires > {now_ms})")
-        elif "dateExpires" in filters:
-            date_expires = filters["dateExpires"]
-            if isinstance(date_expires, (list, tuple)) and len(date_expires) == 2:
-                # Range
-                conditions.append(f"date_expires >= {int(date_expires[0])}")
-                conditions.append(f"date_expires <= {int(date_expires[1])}")
-            else:
-                # Exact match
-                conditions.append(f"date_expires == {int(date_expires)}")
+        # # dateExpires: filter for non-expired jobs (default behavior)
+        # if filters.get("excludeExpired", True):
+        #     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        #     conditions.append(
+        #         f"(date_expires == 0 || date_expires > {now_ms})")
+        # elif "dateExpires" in filters:
+        #     date_expires = filters["dateExpires"]
+        #     if isinstance(date_expires, (list, tuple)) and len(date_expires) == 2:
+        #         # Range
+        #         conditions.append(f"date_expires >= {int(date_expires[0])}")
+        #         conditions.append(f"date_expires <= {int(date_expires[1])}")
+        #     else:
+        #         # Exact match
+        #         conditions.append(f"date_expires == {int(date_expires)}")
 
         # Combine all conditions with AND
         if conditions:
