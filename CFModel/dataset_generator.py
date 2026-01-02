@@ -173,7 +173,7 @@ class AggressiveCFDatasetGenerator:
                     except (ValueError, IndexError):
                         continue
         
-        published = [j for j in jobs if j.get('status') == 'PUBLISHED']
+        published = [j for j in jobs if j.get('status') == 'published']
         logger.info(f"  Parsed {len(jobs)} jobs, {len(published)} published")
         return published
     

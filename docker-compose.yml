@@ -56,25 +56,6 @@ services:
       retries: 3
       start_period: 30s
     restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    container_name: bot-cv-redis
-    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    networks:
-      - bot-cv-network
-    healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-
   # ============================================
   # Vector Database
   # ============================================
@@ -114,60 +95,60 @@ services:
   # Application
   # ============================================
 
-  search-and-recommend-service:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        BUILDKIT_INLINE_CACHE: 1
-    image: bot-cv-recommend:latest
-    container_name: recommend-service
-    ports:
-      - "8000:8000"
-    environment:
-      FLASK_DEBUG: "false"
-      MILVUS_HOST: milvus
-      MILVUS_PORT: 19530
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_DB: 0
-      REDIS_STREAM_NAME: outbox-events
-      REDIS_CONSUMER_GROUP: milvus-sync
-      REDIS_CONSUMER_NAME: worker-1
-      INTERACTION_STREAM_NAME: outbox-events
-      INTERACTION_CONSUMER_GROUP: recommend-service-group
-      INTERACTION_HALF_LIFE_DAYS: 30
-      EMBEDDING_MODEL_NAME: BAAI/bge-m3
-      EMBEDDING_DEVICE: cpu
-      EMBEDDING_USE_FP16: "false"
-      SEARCH_DEFAULT_LIMIT: 10
-      SEARCH_DEFAULT_OFFSET: 0
-      SEARCH_THRESHOLD: 0.3
-      CANDIDATE_API_BASE_URL: http://backend:8080
-      CF_MODEL_PATH: /app/CFModel/models/cf_model.pkl
-    volumes:
-      - ./CFModel/models:/app/CFModel/models:ro
-      # - ./app:/app/app
-      # - ./services:/app/services
-    depends_on:
-      milvus:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - bot-cv-network
-    healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-        reservations:
-          cpus: '1'
-          memory: 2G
-    restart: unless-stopped
+  # search-and-recommend-service:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #     args:
+  #       BUILDKIT_INLINE_CACHE: 1
+  #   image: bot-cv-recommend:latest
+  #   container_name: recommend-service
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     FLASK_DEBUG: "false"
+  #     MILVUS_HOST: milvus
+  #     MILVUS_PORT: 19530
+  #     REDIS_HOST: redis
+  #     REDIS_PORT: 6379
+  #     REDIS_DB: 0
+  #     REDIS_STREAM_NAME: outbox-events
+  #     REDIS_CONSUMER_GROUP: milvus-sync
+  #     REDIS_CONSUMER_NAME: worker-1
+  #     INTERACTION_STREAM_NAME: outbox-events
+  #     INTERACTION_CONSUMER_GROUP: recommend-service-group
+  #     INTERACTION_HALF_LIFE_DAYS: 30
+  #     EMBEDDING_MODEL_NAME: BAAI/bge-m3
+  #     EMBEDDING_DEVICE: cpu
+  #     EMBEDDING_USE_FP16: "false"
+  #     SEARCH_DEFAULT_LIMIT: 10
+  #     SEARCH_DEFAULT_OFFSET: 0
+  #     SEARCH_THRESHOLD: 0.3
+  #     CANDIDATE_API_BASE_URL: http://backend:8080
+  #     CF_MODEL_PATH: /app/CFModel/models/cf_model.pkl
+  #   volumes:
+  #     - ./CFModel/models:/app/CFModel/models:ro
+  #     # - ./app:/app/app
+  #     # - ./services:/app/services
+  #   depends_on:
+  #     milvus:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - bot-cv-network
+  #   healthcheck:
+  #     test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 120s
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: '2'
+  #         memory: 4G
+  #       reservations:
+  #         cpus: '1'
+  #         memory: 2G
+  #   restart: unless-stopped

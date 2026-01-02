@@ -111,8 +111,8 @@ class MilvusService:
             # Initialize embedding function
             self.ef = BGEM3EmbeddingFunction(
                 model_name=Config.EMBEDDING_MODEL_NAME,
-                device=Config.EMBEDDING_DEVICE,
-                use_fp16=Config.EMBEDDING_USE_FP16,
+                device="cpu",
+                use_fp16=False,
             )
             self.dense_dim = self.ef.dim["dense"]
             logger.info("Initialized BGEM3 embedding function")

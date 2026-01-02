@@ -64,7 +64,6 @@ class SyncProcessor:
                 jobs=[job.to_dict(False)],
             )
 
-            print(entities[0])
             upserted = self.milvus_service.upsert_jobs(entities)
             logger.info(f"Synced to Milvus: 1 jobs, upserted={upserted}")
             return SyncResult(processed=1, inserted=upserted, deleted=0)

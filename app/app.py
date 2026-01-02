@@ -38,7 +38,7 @@ def create_app() -> Flask:
         """Start outbox-events consumer (Job sync to Milvus)"""
         try:
             logger.info("Starting Outbox Event Consumer thread...")
-            consumer = OutboxEventConsumer()
+            consumer = OutboxEventConsumer(milvus_service=milvus_service)
             logger.info(
                 "Outbox consumer initialized, processing messages...")
             consumer.run()
@@ -60,29 +60,29 @@ def create_app() -> Flask:
     # ============================================
     # Start Consumer Thread 2: User Interactions
     # ============================================
-    def start_interaction_consumer():
-        """Start user-interactions consumer (Recommendation signals)"""
-        try:
-            logger.info("Starting Interaction Consumer thread...")
-            consumer = InteractionConsumer()
-            logger.info(
-                "Interaction consumer initialized, processing messages...")
-            consumer.run()
-        except KeyboardInterrupt:
-            logger.info("Interaction consumer interrupted by user")
-        except Exception as e:
-            logger.error(f"Interaction consumer error: {e}", exc_info=True)
-            logger.warning(
-                "Interaction consumer stopped, but Flask app continues")
+    # def start_interaction_consumer():
+    #     """Start user-interactions consumer (Recommendation signals)"""
+    #     try:
+    #         logger.info("Starting Interaction Consumer thread...")
+    #         consumer = InteractionConsumer()
+    #         logger.info(
+    #             "Interaction consumer initialized, processing messages...")
+    #         consumer.run()
+    #     except KeyboardInterrupt:
+    #         logger.info("Interaction consumer interrupted by user")
+    #     except Exception as e:
+    #         logger.error(f"Interaction consumer error: {e}", exc_info=True)
+    #         logger.warning(
+    #             "Interaction consumer stopped, but Flask app continues")
 
-    interaction_thread = threading.Thread(
-        target=start_interaction_consumer,
-        daemon=True,
-        name="InteractionConsumer"
-    )
-    interaction_thread.start()
-    logger.info("Interaction Consumer thread started")
+    # interaction_thread = threading.Thread(
+    #     target=start_interaction_consumer,
+    #     daemon=True,
+    #     name="InteractionConsumer"
+    # )
+    # interaction_thread.start()
+    # logger.info("Interaction Consumer thread started")
 
-    logger.info(
-        "Flask application created successfully with 2 consumer threads")
+    # logger.info(
+    #     "Flask application created successfully with 2 consumer threads")
     return app

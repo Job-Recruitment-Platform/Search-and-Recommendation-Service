@@ -22,9 +22,6 @@ class InteractionConsumer:
         self.consumer_group = Config.INTERACTION_CONSUMER_GROUP
         self.consumer_name = Config.INTERACTION_CONSUMER_NAME
 
-        # CSV storage for training data
-        self.csv_storage = InteractionStorage("data/interactions.csv")
-
         self.running = False
         self._setup_consumer_group()
 
@@ -106,30 +103,6 @@ class InteractionConsumer:
             logger.error(f"Failed to update Redis cache: {e}", exc_info=True)
             return False
 
-    def _save_to_csv(self, event: InteractionEvent) -> bool:
-        """Save interaction to CSV for offline training"""
-        try:
-            timestamp = datetime.fromisoformat(
-                event.occurred_at.replace('Z', '+00:00')
-            ).timestamp()
-
-            self.csv_storage.append_interaction(
-                user_id=event.account_id,
-                job_id=event.job_id,
-                interaction_type=event.event_type.value,
-                timestamp=int(timestamp)
-            )
-
-            logger.debug(
-                f"CSV: user={event.account_id}, job={event.job_id}, "
-                f"type={event.event_type.value}"
-            )
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to save to CSV: {e}", exc_info=True)
-            return False
-
     def process_messages(self, count: int = 10, block: int = 5000):
         """Read and process messages from user-interactions stream"""
         try:
@@ -159,20 +132,11 @@ class InteractionConsumer:
                         # Task 1: Cache in Redis (same format as recommend.py)
                         cached = self._update_redis_cache(event)
 
-                        # Task 2: Save to CSV (for training)
-                        saved_csv = self._save_to_csv(event)
-
                         # Log results
-                        if cached and saved_csv:
-                            logger.debug(f"{message_id}: cached + CSV")
-                        elif cached:
-                            logger.warning(
-                                f"{message_id}: cached but CSV failed")
-                        elif saved_csv:
-                            logger.warning(
-                                f"{message_id}: CSV but cache failed")
+                        if cached:
+                            logger.debug(f"{message_id}: cached successfully")
                         else:
-                            logger.error(f"{message_id}: both failed")
+                            logger.error(f"{message_id}: caching failed")
 
                         # ACK message
                         self.redis_client.xack(
@@ -208,7 +172,6 @@ class InteractionConsumer:
         logger.info("=" * 70)
         logger.info(f"   Stream:    {self.stream_name}")
         logger.info(f"   Group:     {self.consumer_group}")
-        logger.info(f"   CSV File:  {self.csv_storage.file_path}")
         logger.info("=" * 70)
 
         retry_count = 0

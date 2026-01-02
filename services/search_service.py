@@ -57,7 +57,6 @@ class SearchService:
             limit=limit * 2,
             expr=filter_expr,
         )
-
         sparse_req = AnnSearchRequest(
             data=[sparse_vec],
             anns_field="sparse_vector",
@@ -75,6 +74,8 @@ class SearchService:
             limit=limit + 1,
             output_fields=["id", "title", "job_role"],
         )
+        
+        logger.info(f"Received {len(results)} result sets from Milvus")
 
         # Process results
         job_ids = []
@@ -144,12 +145,12 @@ class SearchService:
 
     def _build_filter_expression(self, filters: Optional[Dict[str, Any]]) -> Optional[str]:
         if not filters:
-            return "status == 'PUBLISHED'"
+            return "status == 'published'"
 
         conditions = []
 
-        # Status filter: default to PUBLISHED if not specified
-        status = filters.get("status", "PUBLISHED")
+        # Status filter: default to published if not specified
+        status = filters.get("status", "published")
         if status:
             status_escaped = str(status).replace("'", "\\'")
             conditions.append(f"status == '{status_escaped}'")
@@ -223,5 +224,5 @@ class SearchService:
         if conditions:
             return " && ".join(conditions)
 
-        # Fallback: if no conditions were built, default to PUBLISHED
-        return "status == 'PUBLISHED'"
+        # Fallback: if no conditions were built, default to published
+        return "status == 'published'"
