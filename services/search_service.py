@@ -49,19 +49,21 @@ class SearchService:
             sparse_vec = {int(j): float(v) for j, v in zip(coo.col, coo.data)}
             logger.info(f"Sparse vector non-zero entries: {len(sparse_vec)}")
 
+        fetch_limit = (limit + offset + 1) * 3
+
         # Create search requests
         dense_req = AnnSearchRequest(
             data=[dense_vec],
             anns_field="dense_vector",
             param={"metric_type": "COSINE"},
-            limit=limit * 2,
+            limit=fetch_limit,
             expr=filter_expr,
         )
         sparse_req = AnnSearchRequest(
             data=[sparse_vec],
             anns_field="sparse_vector",
             param={"metric_type": "IP"},
-            limit=limit * 2,
+            limit=fetch_limit,
             expr=filter_expr,
         )
 
@@ -70,8 +72,8 @@ class SearchService:
         results = self.milvus_service.jobs_collection.hybrid_search(
             reqs=[dense_req, sparse_req],
             rerank=WeightedRanker(float(0.4), float(0.6)),
-            offset=offset * limit,
-            limit=limit + 1,
+            offset=0,
+            limit=fetch_limit,
             output_fields=["id", "title", "job_role"],
         )
         
@@ -129,8 +131,12 @@ class SearchService:
                 f"⚠️ ALL HITS REJECTED - Consider lowering threshold from {threshold}"
             )
 
-        has_next = len(job_ids) > limit
-        job_ids = job_ids[:limit]
+        total_results = len(job_ids)
+        has_next = total_results > offset + limit
+        has_prev = offset > 0
+        
+        # Apply pagination
+        job_ids = job_ids[offset:offset + limit]
 
         # Build pagination info
         pagination = PaginationInfo(
@@ -138,7 +144,7 @@ class SearchService:
             offset=offset,
             count=len(job_ids),
             has_next=has_next,
-            has_prev=offset > 0,
+            has_prev=has_prev,
         )
 
         return job_ids, pagination
