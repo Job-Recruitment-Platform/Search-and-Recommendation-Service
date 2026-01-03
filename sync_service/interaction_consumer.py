@@ -67,6 +67,7 @@ class InteractionConsumer:
             if cached:
                 try:
                     existing = json.loads(cached)
+                    logger.debug(f"Loaded existing interactions for user {event.account_id}: {len(existing)} types")
                     for key, value in existing.items():
                         if isinstance(value, dict):
                             interactions[key] = value
@@ -76,27 +77,37 @@ class InteractionConsumer:
                 except json.JSONDecodeError:
                     logger.warning(
                         f"Invalid JSON in cache for user {event.account_id}")
+            else:
+                logger.debug(f"No existing interactions for user {event.account_id}")
 
             # Add new interaction
             event_type_upper = event.event_type.value.upper()
             if event_type_upper in INTERACTION_WEIGHTS:
                 interactions[event_type_upper][event.job_id] = timestamp
+                logger.info(
+                    f"✓ Added interaction: user={event.account_id}, job={event.job_id}, "
+                    f"type={event_type_upper}, timestamp={timestamp}"
+                )
+            else:
+                logger.warning(f"Event type {event_type_upper} not in INTERACTION_WEIGHTS")
 
-            # Save back to Redis (TTL 30 days, same as recommend.py uses 7 days)
+            # Save back to Redis (TTL 30 days)
+            final_data = {k: dict(v) for k, v in interactions.items()}
             self.redis_client.setex(
                 cache_key,
                 30 * 24 * 3600,  # 30 days
-                json.dumps({k: dict(v) for k, v in interactions.items()})
+                json.dumps(final_data)
+            )
+            logger.info(
+                f"✓ Saved to Redis: {cache_key}, total types: {len(final_data)}, "
+                f"total interactions: {sum(len(v) for v in final_data.values())}"
             )
 
             # Invalidate user's short-term vector cache
             vector_cache_key = f"user_vector:short_term:{event.account_id}"
-            self.redis_client.delete(vector_cache_key)
+            deleted = self.redis_client.delete(vector_cache_key)
+            logger.info(f"✓ Invalidated vector cache: {vector_cache_key} (deleted={deleted})")
 
-            logger.debug(
-                f"Cached: user={event.account_id}, job={event.job_id}, "
-                f"type={event_type_upper}"
-            )
             return True
 
         except Exception as e:

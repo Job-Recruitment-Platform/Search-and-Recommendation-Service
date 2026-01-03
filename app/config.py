@@ -55,8 +55,6 @@ class Config:
     # Recommendation configuration
     CANDIDATE_API_BASE_URL: str = os.getenv(
         "CANDIDATE_API_BASE_URL", "http://localhost:8080")
-    INTERACTION_STREAM_NAME: str = os.getenv(
-        "INTERACTION_STREAM_NAME", "outbox-events")
     INTERACTION_CONSUMER_GROUP: str = os.getenv(
         "INTERACTION_CONSUMER_GROUP", "recommend-service-group")
     INTERACTION_HALF_LIFE_DAYS: float = float(
@@ -72,10 +70,10 @@ INTERACTION_WEIGHTS = {
     "SAVE": 0.6,  # Medium weight for saving jobs
     # "CLICK" == "VIEW"
     "CLICK_FROM_SIMILAR": 0.2,  # Clicks from similar jobs section
-    "CLICK_FROM_RECOMMENDED": 0.25,  # Clicks from recommended jobs section
-    "CLICK_FROM_SEARCH": 0.4,  # Clicks from search results
+    "CLICK_FROM_RECOMMENDED": 0.5,  # Clicks from recommended jobs section
+    "CLICK_FROM_SEARCH": 0.7,  # Clicks from search results - increased for better search reflection
     # Negative signals
     "SKIP_FROM_SIMILAR": -0.05,  # Skip from similar jobs section
     "SKIP_FROM_RECOMMENDED": -0.15,  # Skip from recommended jobs section
-    "SKIP_FROM_SEARCH": -0.1,  # Skip from search
+    "SKIP_FROM_SEARCH": 0,  # Skip from search
 }

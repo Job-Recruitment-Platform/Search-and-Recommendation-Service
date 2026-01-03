@@ -13,6 +13,7 @@ import pickle
 import requests
 import threading
 import time
+import random
 
 from services.milvus_service import MilvusService
 from app.config import INTERACTION_WEIGHTS, Config
@@ -43,7 +44,7 @@ class RecommendationService:
             # Test connection
             self.redis_client.ping()
         except Exception as e:
-            print(f"Warning: Failed to connect to Redis: {e}")
+            logger.warning(f"Failed to connect to Redis: {e}")
             self.redis_client = None
 
         # Start interaction stream consumer in background
@@ -55,7 +56,6 @@ class RecommendationService:
         top_k: int = 20
     ) -> List[Dict[str, Any]]:
         """Hybrid recommendation entrypoint.
-
         Tách candidate generation và ranking:
         - Candidate: kết hợp CF + content để tăng coverage
         - Ranking: áp dụng trọng số nguồn + exploration post-processing
@@ -84,7 +84,7 @@ class RecommendationService:
             return ranked or self._get_popular_jobs(top_k)
 
         except Exception as e:
-            print(f"Error in recommend(): {e}")
+            logger.error(f"Error in recommend(): {e}", exc_info=True)
             return self._get_popular_jobs(top_k)
 
     def _generate_candidates(
@@ -196,19 +196,53 @@ class RecommendationService:
             if user_id not in self.cf_user_id_to_index:
                 return []
             user_idx = self.cf_user_id_to_index[user_id]
-            # Build dummy user-items row from available data: need the user_item row. We don't have matrix here.
-            # Use model.recommend with user_items=None not allowed; instead pass empty csr row.
+            
+            # Build user-items matrix from actual interactions
             from scipy.sparse import csr_matrix
             max_item_index = max(self.cf_index_to_item_id.keys()
                                  ) if self.cf_index_to_item_id else -1
             num_items = max_item_index + 1 if max_item_index >= 0 else 1
-            user_items = csr_matrix((1, num_items))
+            
+            # Load user interactions to build proper user-item row
+            user_interactions = self._get_user_interactions(user_id)
+            row_data, row_indices = [], []
+            
+            if user_interactions:
+                for interaction_type, entries in user_interactions.items():
+                    weight = INTERACTION_WEIGHTS.get(str(interaction_type).upper(), 0.0)
+                    if weight <= 0:
+                        continue
+                    
+                    job_ids = entries.keys() if isinstance(entries, dict) else entries
+                    for job_id in job_ids:
+                        try:
+                            job_id_int = int(job_id)
+                            if job_id_int in self.cf_item_id_to_index:
+                                item_idx = self.cf_item_id_to_index[job_id_int]
+                                row_data.append(weight)
+                                row_indices.append(item_idx)
+                        except (ValueError, TypeError):
+                            continue
+            
+            # Build sparse row: if no interactions, use empty row (no filter)
+            if row_data:
+                user_items_row = csr_matrix(
+                    (row_data, ([0] * len(row_data), row_indices)),
+                    shape=(1, num_items),
+                    dtype=np.float32
+                )
+                filter_liked = True
+            else:
+                user_items_row = csr_matrix((1, num_items), dtype=np.float32)
+                filter_liked = False
+            
             ids, scores = self.cf_model.recommend(
                 userid=user_idx,
-                user_items=user_items,
+                user_items=user_items_row,
                 N=limit,
-                filter_already_liked_items=True,
+                filter_already_liked_items=filter_liked,
             )
+            
             results: List[Dict[str, Any]] = []
             for idx, score in zip(ids, scores):
                 job_id = self.cf_index_to_item_id.get(int(idx))
@@ -219,7 +253,8 @@ class RecommendationService:
                     "score": float(score),
                 })
             return results
-        except Exception:
+        except Exception as e:
+            logger.warning(f"CF candidate generation failed: {e}")
             return []
 
     def _generate_popular_candidates(
@@ -269,7 +304,7 @@ class RecommendationService:
             if content_score is not None:
                 combined += 0.35 * self._normalize_content_score(content_score)
             if popular_score is not None and cf_score is None and content_score is None:
-                combined += 0.25 * self._normalize_content_score(popular_score)
+                combined += 0.5 * self._normalize_content_score(popular_score)
 
             # Boost nếu candidate đến từ nhiều nguồn
             num_sources = len(candidate.get("sources", []))
@@ -277,10 +312,12 @@ class RecommendationService:
                 combined += 0.05 * (num_sources - 1)
 
             # Exploration bonus cho job chưa từng tương tác
+            # Only apply if base score is reasonable (above 0.2) to avoid irrelevant jobs
             if job_id not in seen_job_ids:
-                combined += self._exploration_bonus(job_id)
+                if combined >= 0.2:  # Threshold to ensure minimum relevance
+                    combined += self._exploration_bonus(job_id)
             else:
-                combined *= 0.85  # giảm ưu tiên job đã xem
+                combined *= 0.95  # giảm nhẹ ưu tiên job đã xem
 
             ranked_results.append({
                 "job_id": job_id,
@@ -288,7 +325,28 @@ class RecommendationService:
             })
 
         ranked_results.sort(key=lambda item: item["score"], reverse=True)
-        top_results = ranked_results[:top_k]
+        
+        # Apply stochastic sampling to top candidates for diversity
+        # Take top_k * 1.5 candidates and randomly sample from them
+        pool_size = min(len(ranked_results), int(top_k * 1.5))
+        top_pool = ranked_results[:pool_size]
+        
+        # Weight by normalized scores for sampling
+        if len(top_pool) > top_k:
+            scores = np.array([item["score"] for item in top_pool])
+            # Softmax with temperature for diversity
+            temperature = 0.5  # Lower = more deterministic, higher = more random
+            exp_scores = np.exp((scores - scores.max()) / temperature)
+            probabilities = exp_scores / exp_scores.sum()
+            
+            # Sample without replacement
+            selected_indices = np.random.choice(
+                len(top_pool), size=top_k, replace=False, p=probabilities
+            )
+            top_results = [top_pool[i] for i in selected_indices]
+        else:
+            top_results = top_pool[:top_k]
+        
         return [{"job_id": item["job_id"]} for item in top_results]
 
     def _normalize_cf_score(self, score: float) -> float:
@@ -308,10 +366,17 @@ class RecommendationService:
         return (val + 1.0) / 2.0
 
     def _exploration_bonus(self, job_id: int) -> float:
-        """Bonus deterministic cho exploration."""
+        """Bonus with randomness for exploration diversity."""
+        # Deterministic component based on job_id
         hashed = hash(("explore", int(job_id)))
-        noise = (hashed & 0xFFFF) / 0xFFFF  # 0..1
-        return 0.03 + 0.02 * noise
+        deterministic_noise = (hashed & 0xFFFF) / 0xFFFF  # 0..1
+        
+        # Random component for diversity across requests
+        random_noise = random.random()  # 0..1
+        
+        # Combine: 30% deterministic, 70% random for more diversity
+        noise = 0.3 * deterministic_noise + 0.7 * random_noise
+        return 0.01 + 0.02 * noise  # Range: 0.01-0.03 (increased from 0.005-0.01)
 
     def _collect_seen_job_ids(self, interactions: Optional[Dict[str, Any]]) -> set:
         """Tập job user đã tương tác."""
@@ -408,7 +473,7 @@ class RecommendationService:
                 output_fields=["id"],
             )
         except Exception as err:
-            print(f"Warning: content candidate search failed: {err}")
+            logger.warning(f"Content candidate search failed: {err}")
             return []
 
         if not search_results or len(search_results) == 0 or not search_results[0]:
@@ -462,6 +527,18 @@ class RecommendationService:
         Returns:
            Normalized dense vector representing long-term user preferences
         """
+        user_id = user_profile.get("id")
+        
+        # Check if long-term vector already exists in Milvus
+        if user_id is not None:
+            try:
+                existing_vector = self.milvus_service.get_user_vector(int(user_id))
+                if existing_vector:
+                    logger.debug(f"Using cached long-term vector for user {user_id}")
+                    return existing_vector
+            except Exception as e:
+                logger.debug(f"Failed to get cached vector for user {user_id}: {e}")
+        
         # Build profile text (without interaction insights for long-term vector)
         profile_text = self._build_profile_text(
             user_profile, user_interactions=None)
@@ -486,14 +563,14 @@ class RecommendationService:
         profile_dense = self._normalize_vector(profile_dense.tolist())
 
         # Save to Milvus (long-term storage)
-        user_id = user_profile.get("id")
         if user_id is not None:
             try:
                 self.milvus_service.upsert_user_vector(
                     int(user_id), profile_dense)
+                logger.debug(f"Saved long-term vector for user {user_id}")
             except Exception as e:
-                print(
-                    f"Warning: Failed to upsert long-term user vector for user {user_id}: {e}")
+                logger.warning(
+                    f"Failed to upsert long-term user vector for user {user_id}: {e}")
 
         return profile_dense
 
@@ -501,7 +578,7 @@ class RecommendationService:
         self,
         user_id: int,
         user_interactions: Dict[str, Any],
-        cache_ttl: int = 3600
+        cache_ttl: int = 14400
     ) -> List[float]:
         """Calculate short-term user vector from recent interactions.
 
@@ -512,7 +589,7 @@ class RecommendationService:
         Args:
            user_id: User ID
            user_interactions: Dictionary of user interactions with timestamps
-           cache_ttl: Time-to-live for Redis cache in seconds (default: 1 hour)
+           cache_ttl: Time-to-live for Redis cache in seconds (default: 4 hours)
 
         Returns:
            Normalized dense vector representing short-term user interests
@@ -527,7 +604,7 @@ class RecommendationService:
                         cached = cached.decode()
                     return json.loads(cached)
             except Exception as e:
-                print(f"Warning: Failed to read from Redis cache: {e}")
+                logger.debug(f"Failed to read from Redis cache: {e}")
 
         # Compute behavior vector from interactions
         behavior_dense = self._compute_behavior_dense(
@@ -538,8 +615,9 @@ class RecommendationService:
         if not behavior_dense:
             return []
 
-        # Normalize to unit vector using numpy
-        behavior_dense = self._normalize_vector(behavior_dense)
+        # Note: behavior_dense is already normalized by weight_sum in _compute_behavior_dense
+        # No need to normalize again - that would lose magnitude information
+        # which reflects the number and recency of interactions
 
         # Cache in Redis (short-term storage)
         if self.redis_client:
@@ -550,8 +628,8 @@ class RecommendationService:
                     json.dumps(behavior_dense)
                 )
             except Exception as e:
-                print(
-                    f"Warning: Failed to cache short-term user vector in Redis: {e}")
+                logger.warning(
+                    f"Failed to cache short-term user vector in Redis: {e}")
 
         return behavior_dense
 
@@ -569,8 +647,8 @@ class RecommendationService:
                 cache_key = f"user_vector:short_term:{user_id}"
                 self.redis_client.delete(cache_key)
             except Exception as e:
-                print(
-                    f"Warning: Failed to invalidate short-term cache for user {user_id}: {e}")
+                logger.warning(
+                    f"Failed to invalidate short-term cache for user {user_id}: {e}")
 
     def _calculate_user_vector(
         self,
@@ -600,7 +678,7 @@ class RecommendationService:
             int(user_id),
             user_interactions
         )
-
+        
         # If no interactions, return long-term vector only
         if not short_term_vector:
             return long_term_vector
@@ -608,13 +686,13 @@ class RecommendationService:
         # Count interactions for adaptive weights
         interaction_count = self._count_total_interactions(user_interactions)
 
-        # Adaptive weights
+        # Adaptive weights - adjusted to better reflect recent behavior
         if interaction_count < 5:
-            alpha, beta = 0.9, 0.1  # Cold start
+            alpha, beta = 0.5, 0.5  # Cold start - equal weight for immediate behavior reflection
         elif interaction_count < 20:
-            alpha, beta = 0.6, 0.4  # Growing
+            alpha, beta = 0.4, 0.6  # Growing - favor behavior
         else:
-            alpha, beta = 0.3, 0.7  # Mature
+            alpha, beta = 0.3, 0.7  # Mature - strong behavior preference
 
         # Combine long-term and short-term vectors
         final_dense = self._combine_vectors(
@@ -741,7 +819,7 @@ class RecommendationService:
                 if data.get("code") == 1000 and data.get("data"):
                     return data["data"]
         except Exception as e:
-            print(f"Warning: Failed to fetch job metadata from API: {e}")
+            logger.warning(f"Failed to fetch job metadata from API: {e}")
 
         return []
 
@@ -784,7 +862,17 @@ class RecommendationService:
         weight_sum: float = 0.0
 
         if not isinstance(interactions, dict):
+            logger.warning(f"Interactions is not a dict, type={type(interactions)}, returning zero vector")
             return [0.0] * dimension
+        
+        if len(interactions) == 0:
+            logger.warning("Interactions dict is empty, returning zero vector")
+            return [0.0] * dimension
+
+        # Track statistics for debugging
+        total_interactions = 0
+        jobs_with_vectors = 0
+        jobs_without_vectors = []
 
         for raw_key, entries in interactions.items():
             key_upper = str(raw_key).upper()
@@ -801,15 +889,19 @@ class RecommendationService:
                 continue
 
             for job_id, ts in items:
+                total_interactions += 1
                 try:
                     j_id = int(job_id)
                 except Exception:
+                    logger.debug(f"Invalid job_id format: {job_id}")
                     continue
 
                 job_vec = self.milvus_service.get_job_dense_vector(j_id)
                 if not job_vec or len(job_vec) != dimension:
+                    jobs_without_vectors.append(j_id)
                     continue
 
+                jobs_with_vectors += 1
                 decay = self._exp_time_decay(ts, now_ts, half_life_days)
                 w = base_w * decay
 
@@ -817,11 +909,39 @@ class RecommendationService:
                 acc += w * np.array(job_vec, dtype=np.float32)
                 weight_sum += abs(w)
 
+        # Log statistics
+        logger.info(
+            f"Behavior vector: {total_interactions} interactions, "
+            f"{jobs_with_vectors} with vectors, "
+            f"{len(jobs_without_vectors)} without vectors"
+        )
+        if jobs_without_vectors and len(jobs_without_vectors) <= 10:
+            logger.warning(
+                f"Jobs without vectors in Milvus: {jobs_without_vectors}"
+            )
+        elif len(jobs_without_vectors) > 10:
+            logger.warning(
+                f"Jobs without vectors in Milvus: {jobs_without_vectors[:10]}... "
+                f"(+{len(jobs_without_vectors) - 10} more)"
+            )
+
         # Normalize using numpy
         if weight_sum > 1e-8:
             acc = acc / weight_sum
+            # Calculate vector magnitude for debugging
+            vec_norm = np.linalg.norm(acc)
+            non_zero_dims = np.count_nonzero(acc > 1e-6)
+            logger.info(
+                f"Behavior vector: {total_interactions} interactions, "
+                f"{jobs_with_vectors} with vectors, weight_sum={weight_sum:.4f}, "
+                f"norm={vec_norm:.4f}, non_zero_dims={non_zero_dims}"
+            )
             return acc.tolist()
 
+        logger.warning(
+            f"Zero weight_sum after processing {total_interactions} interactions. "
+            f"Returning zero vector."
+        )
         return [0.0] * dimension
 
     def _normalize_vector(self, vector: List[float]) -> List[float]:
@@ -1145,20 +1265,11 @@ class RecommendationService:
     # --------------------------------------------------------------------- #
 
     def _get_user_profile(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Lấy user profile từ API hoặc Milvus.
+        """Lấy user profile từ API.
 
-        Nếu chưa có user vector trên Milvus, gọi API để lấy profile.
+        Luôn fetch profile từ API để có đầy đủ thông tin.
+        Long-term vector sẽ được cache riêng trong Milvus.
         """
-        # Kiểm tra xem đã có user vector trên Milvus chưa
-        try:
-            user_vector = self.milvus_service.get_user_vector(user_id)
-            if user_vector:
-                # Đã có vector, không cần gọi API
-                return None
-        except Exception:
-            pass
-
-        # Chưa có vector, gọi API lấy profile
         try:
             api_url = f"{Config.CANDIDATE_API_BASE_URL}/api/candidates/profile/{user_id}"
             response = requests.get(api_url, timeout=5)
@@ -1172,7 +1283,7 @@ class RecommendationService:
                             "educations")
                     return profile_data
         except Exception as e:
-            print(f"Warning: Failed to fetch user profile from API: {e}")
+            logger.warning(f"Failed to fetch user profile from API: {e}")
 
         return None
 
@@ -1189,7 +1300,7 @@ class RecommendationService:
                     cached = cached.decode()
                 return json.loads(cached)
         except Exception as e:
-            print(f"Warning: Failed to get user interactions from cache: {e}")
+            logger.debug(f"Failed to get user interactions from cache: {e}")
 
         return {}
 
@@ -1207,7 +1318,7 @@ class RecommendationService:
                 if data.get("code") == 1000 and data.get("data"):
                     return data["data"]
         except Exception as e:
-            print(f"Warning: Failed to fetch popular jobs from API: {e}")
+            logger.warning(f"Failed to fetch popular jobs from API: {e}")
 
         return []
 
