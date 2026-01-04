@@ -17,6 +17,7 @@ import random
 
 from services.milvus_service import MilvusService
 from app.config import INTERACTION_WEIGHTS, Config
+from pymilvus import AnnSearchRequest, WeightedRanker
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ class RecommendationService:
             entry = ensure_candidate(cand["job_id"])
             entry["score_sources"]["cf"] = cand["score"]
             entry["sources"].add("cf")
+            print(f"CF candidate: {cand['job_id']} with score {cand['score']}")
 
         # Content-based candidates
         for cand in self._generate_content_candidates(
@@ -125,14 +127,14 @@ class RecommendationService:
             entry = ensure_candidate(cand["job_id"])
             entry["score_sources"]["content"] = cand["score"]
             entry["sources"].add("content")
-
+            print(f"Content candidate: {cand['job_id']} with score {cand['score']}")
         # Coverage boost: nếu vẫn thiếu candidate, bổ sung popular
         if not candidate_map or len(candidate_map) < top_k:
             for cand in self._generate_popular_candidates(limit=top_k * 2):
                 entry = ensure_candidate(cand["job_id"])
                 entry["score_sources"].setdefault("popular", cand["score"])
                 entry["sources"].add("popular")
-
+                print(f"Popular candidate: {cand['job_id']} with score {cand['score']}")
         return list(candidate_map.values())
 
     def _load_cf_model(self, force_reload: bool = False) -> bool:
@@ -285,43 +287,75 @@ class RecommendationService:
         user_interactions: Optional[Dict[str, Any]],
         top_k: int,
     ) -> List[Dict[str, Any]]:
-        """Xếp hạng candidate với chiến lược hybrid + exploration."""
+        """Xếp hạng candidate với chiến lược hybrid + exploration.
+        
+        Balanced approach: 50% CF + 50% Content để có kết quả từ cả 2 phía.
+        """
 
         seen_job_ids = self._collect_seen_job_ids(user_interactions)
         ranked_results: List[Dict[str, Any]] = []
+        
+        # Balanced weights: 50/50 CF and Content
+        cf_weight = 0.5
+        content_weight = 0.5
+        
+        logger.info(
+            f"Ranking for user {user_id}: balanced weights - "
+            f"cf={cf_weight}, content={content_weight}"
+        )
 
         for candidate in candidates:
             job_id = candidate["job_id"]
             score_sources = candidate.get("score_sources", {})
+            sources = candidate.get("sources", set())
 
             cf_score = score_sources.get("cf")
             content_score = score_sources.get("content")
             popular_score = score_sources.get("popular")
 
             combined = 0.0
+            cf_normalized = 0.0
+            content_normalized = 0.0
+            
             if cf_score is not None:
-                combined += 0.65 * self._normalize_cf_score(cf_score)
+                cf_normalized = self._normalize_cf_score(cf_score)
+                combined += cf_weight * cf_normalized
             if content_score is not None:
-                combined += 0.35 * self._normalize_content_score(content_score)
+                content_normalized = self._normalize_content_score(content_score)
+                combined += content_weight * content_normalized
             if popular_score is not None and cf_score is None and content_score is None:
                 combined += 0.5 * self._normalize_content_score(popular_score)
 
-            # Boost nếu candidate đến từ nhiều nguồn
-            num_sources = len(candidate.get("sources", []))
+            # Boost nếu candidate đến từ nhiều nguồn (có cả CF và Content)
+            num_sources = len(sources)
+            multi_source_bonus = 0.0
             if num_sources > 1:
-                combined += 0.05 * (num_sources - 1)
+                multi_source_bonus = 0.1 * (num_sources - 1)  # Increased bonus for multi-source
+                combined += multi_source_bonus
 
             # Exploration bonus cho job chưa từng tương tác
-            # Only apply if base score is reasonable (above 0.2) to avoid irrelevant jobs
+            exploration_bonus = 0.0
             if job_id not in seen_job_ids:
                 if combined >= 0.2:  # Threshold to ensure minimum relevance
-                    combined += self._exploration_bonus(job_id)
+                    exploration_bonus = self._exploration_bonus(job_id)
+                    combined += exploration_bonus
             else:
                 combined *= 0.95  # giảm nhẹ ưu tiên job đã xem
+            
+            # Log first 10 for debugging
+            if len(ranked_results) < 10:
+                sources_str = ",".join(sources)
+                logger.info(
+                    f"  Job {job_id} [{sources_str}]: "
+                    f"cf={cf_normalized:.3f}, content={content_normalized:.3f}, "
+                    f"multi_src={multi_source_bonus:.3f}, explore={exploration_bonus:.3f}, "
+                    f"final={combined:.3f}"
+                )
 
             ranked_results.append({
                 "job_id": job_id,
                 "score": combined,
+                "sources": sources,  # Keep for analysis
             })
 
         ranked_results.sort(key=lambda item: item["score"], reverse=True)
@@ -445,30 +479,24 @@ class RecommendationService:
         if user_profile:
             user_vector = self._calculate_user_vector(
                 user_profile, user_interactions or {})
-        elif user_interactions:
-            user_vector = self._calculate_short_term_user_vector(
-                user_id, user_interactions)
 
         if not user_vector:
             return []
 
         try:
-            # Use Milvus collection hybrid_search with dense vector only
-            from pymilvus import AnnSearchRequest
-
             dense_req = AnnSearchRequest(
                 data=[user_vector],
                 anns_field="dense_vector",
                 param={"metric_type": "COSINE"},
-                limit=max(1, limit),
+                limit=max(1, limit)
             )
-
-            # hybrid_search requires rerank parameter, use WeightedRanker with weight 1.0 for dense only
-            from pymilvus import WeightedRanker
-
-            search_results = self.milvus_service.jobs_collection.hybrid_search(
-                reqs=[dense_req],
-                rerank=WeightedRanker(float(1.0)),
+            
+            # Use Milvus collection search with dense vector only
+            search_results = self.milvus_service.jobs_collection.search(
+                data=[user_vector],
+                anns_field="dense_vector",
+                rerank=WeightedRanker(1.0),
+                param={"metric_type": "COSINE"},
                 limit=max(1, limit),
                 output_fields=["id"],
             )
@@ -602,17 +630,24 @@ class RecommendationService:
                 if cached:
                     if isinstance(cached, (bytes, bytearray)):
                         cached = cached.decode()
+                    logger.info(f"✓ Cache HIT for short-term vector: {cache_key}")
                     return json.loads(cached)
+                else:
+                    logger.info(f"Cache MISS for short-term vector: {cache_key}")
             except Exception as e:
-                logger.debug(f"Failed to read from Redis cache: {e}")
+                logger.warning(f"Failed to read from Redis cache: {e}")
+        else:
+            logger.warning("Redis client is None - cannot use cache")
 
         # Compute behavior vector from interactions
+        logger.info(f"Computing short-term vector for user {user_id}...")
         behavior_dense = self._compute_behavior_dense(
             user_interactions,
             self.milvus_service.dense_dim
         )
 
         if not behavior_dense:
+            logger.warning(f"Behavior vector is empty for user {user_id} - not caching")
             return []
 
         # Note: behavior_dense is already normalized by weight_sum in _compute_behavior_dense
@@ -627,9 +662,15 @@ class RecommendationService:
                     cache_ttl,
                     json.dumps(behavior_dense)
                 )
+                logger.info(
+                    f"✓ Cached short-term vector for user {user_id}: "
+                    f"key={cache_key}, ttl={cache_ttl}s, dims={len(behavior_dense)}"
+                )
             except Exception as e:
                 logger.warning(
                     f"Failed to cache short-term user vector in Redis: {e}")
+        else:
+            logger.warning(f"Redis client is None - cannot cache vector for user {user_id}")
 
         return behavior_dense
 

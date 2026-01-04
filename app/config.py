@@ -74,6 +74,6 @@ INTERACTION_WEIGHTS = {
     "CLICK_FROM_SEARCH": 0.7,  # Clicks from search results - increased for better search reflection
     # Negative signals
     "SKIP_FROM_SIMILAR": -0.05,  # Skip from similar jobs section
-    "SKIP_FROM_RECOMMENDED": -0.15,  # Skip from recommended jobs section
+    "SKIP_FROM_RECOMMENDED": -0.05,  # Skip from recommended jobs section
     "SKIP_FROM_SEARCH": 0,  # Skip from search
 }
