@@ -175,7 +175,6 @@ def retrain_model(
         factors=base_model.factors,
         regularization=base_model.regularization,
         iterations=INCREMENTAL_ITERATIONS,
-        use_gpu=base_model.use_gpu,
         random_state=base_model.random_state,
         calculate_training_loss=True,
     )
