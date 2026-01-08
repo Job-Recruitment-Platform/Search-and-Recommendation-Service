@@ -1,359 +1,299 @@
+"""
+CF RETRAIN (INCREMENTAL / TĂNG CƯỜNG) – PRODUCTION READY
+======================================================
+
+Long-term events & weights:
+- APPLY                  : 1.0
+- SAVE                   : 0.6
+- CLICK_FROM_SEARCH      : 0.7
+- CLICK_FROM_RECOMMENDED : 0.5
+
+--------------------------------------------------
+INPUT CSV (DELTA ONLY):
+user_id,job_id,event_type,occurred_at
+--------------------------------------------------
+
+OUTPUT:
+- cf_model_candidate.pkl
+
+NOTE:
+- KHÔNG deploy
+- KHÔNG evaluate
+- Sinh model ứng viên cho bước evaluate
+"""
+
+from __future__ import annotations
+
 import os
+import time
 import pickle
-import numpy as np
-import pandas as pd
-from scipy.sparse import csr_matrix
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple
+
+import pandas as pd
+import numpy as np
+from scipy.sparse import csr_matrix
 from implicit.als import AlternatingLeastSquares
-from datetime import datetime
-from app.config import INTERACTION_WEIGHTS
 
 
-class RetrainService:
+# ======================================================
+# CONFIGURATION (BUSINESS-DRIVEN)
+# ======================================================
 
-    POSITIVE_INTERACTION_TYPES = [
-        'APPLY', 'SAVE',
-        'CLICK_FROM_SEARCH', 'CLICK_FROM_RECOMMENDED', 'CLICK_FROM_SIMILAR',
-    ]
+EVENT_WEIGHTS: Dict[str, float] = {
+    "APPLY": 1.0,
+    "SAVE": 0.6,
+    "CLICK_FROM_SEARCH": 0.7,
+    "CLICK_FROM_RECOMMENDED": 0.5,
+}
 
-    def __init__(
-        self,
-        base_model_path: str = 'CFModel/models/cf_model.pkl',
-        output_model_path: str = 'CFModel/models/retrain_cf_model.pkl',
-        interaction_weights: Optional[Dict[str, float]] = None,
-    ):
-        self.base_model_path = base_model_path
-        self.output_model_path = output_model_path
-        self.interaction_weights = interaction_weights or INTERACTION_WEIGHTS
+ALLOWED_EVENTS = set(EVENT_WEIGHTS.keys())
 
-        self.model: Optional[AlternatingLeastSquares] = None
-        self.user_id_to_index: Dict[int, int] = {}
-        self.item_id_to_index: Dict[int, int] = {}
-        self.index_to_user_id: Dict[int, int] = {}
-        self.index_to_item_id: Dict[int, int] = {}
-        self.user_item_matrix: Optional[csr_matrix] = None
-        self.params: Dict = {}
+INCREMENTAL_ITERATIONS = 10
+BLEND_FACTOR = 0.7
 
-    def _load_base_model(self) -> bool:
-        if not os.path.exists(self.base_model_path):
-            print(f"Base model not found at {self.base_model_path}")
-            return False
+BASE_MODEL_PATH = "CFModel/models/cf_model.pkl"
+INCREMENTAL_CSV_PATH = "data/cf_incremental.csv"
+CANDIDATE_MODEL_PATH = "CFModel/models/cf_model_candidate.pkl"
 
-        with open(self.base_model_path, 'rb') as f:
-            data = pickle.load(f)
 
-        self.model = data['model']
-        self.user_id_to_index = data['user_id_to_index']
-        self.item_id_to_index = data['item_id_to_index']
-        self.index_to_user_id = data['index_to_user_id']
-        self.index_to_item_id = data['index_to_item_id']
-        self.params = data.get('params', {
-            'factors': 64,
-            'regularization': 0.01,
-            'iterations': 30,
-            'use_gpu': False,
-            'random_state': 42,
-        })
+# ======================================================
+# STEP 1: LOAD BASE MODEL
+# ======================================================
 
-        print(f"Loaded base model from {self.base_model_path}")
-        print(
-            f"  - Users: {len(self.user_id_to_index)}, Items: {len(self.item_id_to_index)}")
-        return True
+def load_base_model(path: str) -> Dict:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Base model not found: {path}")
 
-    def _read_csv_data(self, csv_path: str) -> pd.DataFrame:
-        df = pd.read_csv(csv_path)
+    with open(path, "rb") as f:
+        data = pickle.load(f)
 
-        required_columns = ['user_id', 'job_id',
-                            'interaction_type', 'timestamp']
-        missing_cols = [
-            col for col in required_columns if col not in df.columns]
-        if missing_cols:
-            raise ValueError(f"CSV missing required columns: {missing_cols}")
+    required = {
+        "model",
+        "user_id_to_index",
+        "item_id_to_index",
+        "index_to_user_id",
+        "index_to_item_id",
+    }
+    if not required.issubset(data.keys()):
+        raise ValueError("Invalid base model format")
 
-        print(f"Read {len(df)} interactions from {csv_path}")
-        return df
+    return data
 
-    def _build_incremental_matrix(
-        self,
-        new_interactions: pd.DataFrame
-    ) -> Tuple[csr_matrix, Dict[int, int], Dict[int, int], Dict[int, int], Dict[int, int]]:
-        user_item_weights = defaultdict(float)
-        for _, row in new_interactions.iterrows():
-            user_id = int(row['user_id'])
-            item_id = int(row['job_id'])
-            interaction_type = row['interaction_type']
-            weight = self.interaction_weights.get(interaction_type, 0.0)
-            user_item_weights[(user_id, item_id)] += weight
 
-        existing_users = set(self.user_id_to_index.keys())
-        existing_items = set(self.item_id_to_index.keys())
+# ======================================================
+# STEP 2: LOAD INCREMENTAL DATA
+# ======================================================
 
-        new_user_ids = set()
-        new_item_ids = set()
-        for (user_id, item_id) in user_item_weights.keys():
-            if user_id not in existing_users:
-                new_user_ids.add(user_id)
-            if item_id not in existing_items:
-                new_item_ids.add(item_id)
+def load_incremental_data(csv_path: str) -> pd.DataFrame:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Incremental CSV not found: {csv_path}")
 
-        user_id_to_index = dict(self.user_id_to_index)
-        index_to_user_id = dict(self.index_to_user_id)
-        next_user_idx = len(user_id_to_index)
-        for uid in sorted(new_user_ids):
-            user_id_to_index[uid] = next_user_idx
-            index_to_user_id[next_user_idx] = uid
-            next_user_idx += 1
+    df = pd.read_csv(csv_path)
 
-        item_id_to_index = dict(self.item_id_to_index)
-        index_to_item_id = dict(self.index_to_item_id)
-        next_item_idx = len(item_id_to_index)
-        for iid in sorted(new_item_ids):
-            item_id_to_index[iid] = next_item_idx
-            index_to_item_id[next_item_idx] = iid
-            next_item_idx += 1
+    required_columns = {"user_id", "job_id", "event_type", "occurred_at"}
+    missing = required_columns - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV missing required columns: {missing}")
 
-        n_users = len(user_id_to_index)
-        n_items = len(item_id_to_index)
+    df = df[df["event_type"].isin(ALLOWED_EVENTS)]
 
-        rows, cols, values = [], [], []
-        for (user_id, item_id), weight in user_item_weights.items():
-            user_idx = user_id_to_index[user_id]
-            item_idx = item_id_to_index[item_id]
-            if weight <= 0:
-                weight = 0.01
-            rows.append(user_idx)
-            cols.append(item_idx)
-            values.append(weight)
+    if df.empty:
+        raise ValueError("No valid incremental events after filtering")
 
-        new_matrix = csr_matrix(
-            (values, (rows, cols)),
-            shape=(n_users, n_items),
-            dtype=np.float32,
-        )
+    return df
 
-        print(f"Built incremental matrix: {n_users} users x {n_items} items")
-        print(
-            f"  - New users: {len(new_user_ids)}, New items: {len(new_item_ids)}")
 
-        return new_matrix, user_id_to_index, item_id_to_index, index_to_user_id, index_to_item_id
+# ======================================================
+# STEP 3: BUILD INCREMENTAL MATRIX
+# ======================================================
 
-    def retrain(
-        self,
-        csv_path: str,
-        incremental_iterations: int = 10,
-    ) -> Dict:
-        if not self._load_base_model():
-            return {'success': False, 'error': 'Failed to load base model'}
+def build_incremental_matrix(
+    df: pd.DataFrame,
+    user_id_to_index: Dict[int, int],
+    item_id_to_index: Dict[int, int],
+    index_to_user_id: Dict[int, int],
+    index_to_item_id: Dict[int, int],
+) -> Tuple[csr_matrix, Dict, Dict, Dict, Dict]:
 
-        try:
-            new_data = self._read_csv_data(csv_path)
-        except Exception as e:
-            return {'success': False, 'error': f'Failed to read CSV: {str(e)}'}
+    aggregated_weights: Dict[Tuple[int, int], float] = defaultdict(float)
 
-        if len(new_data) == 0:
-            return {'success': False, 'error': 'No interactions in CSV file'}
+    for row in df.itertuples(index=False):
+        user_id = int(row.user_id)
+        job_id = int(row.job_id)
+        event_type = row.event_type
 
-        (
-            new_matrix,
-            user_id_to_index,
-            item_id_to_index,
-            index_to_user_id,
-            index_to_item_id,
-        ) = self._build_incremental_matrix(new_data)
+        aggregated_weights[(user_id, job_id)] += EVENT_WEIGHTS[event_type]
 
-        old_n_users, old_n_items = len(
-            self.user_id_to_index), len(self.item_id_to_index)
-        new_n_users, new_n_items = len(user_id_to_index), len(item_id_to_index)
+    # Mở rộng mapping nếu có user/item mới
+    for user_id, job_id in aggregated_weights.keys():
+        if user_id not in user_id_to_index:
+            new_idx = len(user_id_to_index)
+            user_id_to_index[user_id] = new_idx
+            index_to_user_id[new_idx] = user_id
 
-        factors = self.params.get('factors', 64)
-        incremental_model = AlternatingLeastSquares(
-            factors=factors,
-            regularization=self.params.get('regularization', 0.01),
-            iterations=incremental_iterations,
-            use_gpu=self.params.get('use_gpu', False),
-            calculate_training_loss=True,
-            random_state=self.params.get('random_state', 42),
-        )
+        if job_id not in item_id_to_index:
+            new_idx = len(item_id_to_index)
+            item_id_to_index[job_id] = new_idx
+            index_to_item_id[new_idx] = job_id
 
-        if self.model is not None and hasattr(self.model, 'user_factors') and hasattr(self.model, 'item_factors'):
-            old_user_factors = self.model.user_factors
-            new_user_factors = np.random.normal(
-                0, 0.01, (new_n_users, factors)).astype(np.float32)
-            new_user_factors[:old_n_users,
-                             :] = old_user_factors[:old_n_users, :]
+    n_users = len(user_id_to_index)
+    n_items = len(item_id_to_index)
 
-            old_item_factors = self.model.item_factors
-            new_item_factors = np.random.normal(
-                0, 0.01, (new_n_items, factors)).astype(np.float32)
-            new_item_factors[:old_n_items,
-                             :] = old_item_factors[:old_n_items, :]
+    rows, cols, values = [], [], []
 
-            item_user_matrix = new_matrix.T.tocsr()
-            incremental_model.fit(item_user_matrix, show_progress=True)
+    for (user_id, job_id), weight in aggregated_weights.items():
+        rows.append(user_id_to_index[user_id])
+        cols.append(item_id_to_index[job_id])
+        values.append(max(float(weight), 0.01))  # implicit ALS constraint
 
-            blend_factor = 0.7
-            if hasattr(incremental_model, 'user_factors'):
-                incremental_model.user_factors[:old_n_users, :] = (
-                    blend_factor * new_user_factors[:old_n_users, :] +
-                    (1 - blend_factor) *
-                    incremental_model.user_factors[:old_n_users, :]
-                )
-            if hasattr(incremental_model, 'item_factors'):
-                incremental_model.item_factors[:old_n_items, :] = (
-                    blend_factor * new_item_factors[:old_n_items, :] +
-                    (1 - blend_factor) *
-                    incremental_model.item_factors[:old_n_items, :]
-                )
-        else:
-            item_user_matrix = new_matrix.T.tocsr()
-            incremental_model.fit(item_user_matrix, show_progress=True)
+    matrix = csr_matrix(
+        (values, (rows, cols)),
+        shape=(n_users, n_items),
+        dtype=np.float32,
+    )
 
-        self.model = incremental_model
-        self.user_id_to_index = user_id_to_index
-        self.item_id_to_index = item_id_to_index
-        self.index_to_user_id = index_to_user_id
-        self.index_to_item_id = index_to_item_id
-        self.user_item_matrix = new_matrix
+    return (
+        matrix,
+        user_id_to_index,
+        item_id_to_index,
+        index_to_user_id,
+        index_to_item_id,
+    )
 
-        self._save_model()
 
-        return {
-            'success': True,
-            'old_users': old_n_users,
-            'old_items': old_n_items,
-            'new_users': new_n_users,
-            'new_items': new_n_items,
-            'added_users': new_n_users - old_n_users,
-            'added_items': new_n_items - old_n_items,
-            'interactions_processed': len(new_data),
-            'output_path': self.output_model_path,
-        }
+# ======================================================
+# STEP 4: RETRAIN ALS (WARM-START)
+# ======================================================
 
-    def _save_model(self) -> None:
-        os.makedirs(os.path.dirname(self.output_model_path), exist_ok=True)
+def retrain_model(
+    base_model: AlternatingLeastSquares,
+    incremental_matrix: csr_matrix,
+) -> AlternatingLeastSquares:
 
-        data = {
-            'model': self.model,
-            'user_id_to_index': self.user_id_to_index,
-            'item_id_to_index': self.item_id_to_index,
-            'index_to_user_id': self.index_to_user_id,
-            'index_to_item_id': self.index_to_item_id,
-            'params': self.params,
-            'retrained_at': datetime.now().isoformat(),
-        }
+    model = AlternatingLeastSquares(
+        factors=base_model.factors,
+        regularization=base_model.regularization,
+        iterations=INCREMENTAL_ITERATIONS,
+        random_state=base_model.random_state,
+        calculate_training_loss=True,
+    )
 
-        with open(self.output_model_path, 'wb') as f:
-            pickle.dump(data, f)
+    model.fit(incremental_matrix.T.tocsr(), show_progress=True)
+    return model
 
-        print(f"Saved retrained model to {self.output_model_path}")
 
-    # for test
-    def _recommend(
-        self,
-        user_id: int,
-        k: int = 10,
-    ) -> List[Tuple[int, float]]:
-        if self.model is None or user_id not in self.user_id_to_index:
-            return []
+# ======================================================
+# STEP 5: BLEND OLD & NEW FACTORS
+# ======================================================
 
-        user_idx = self.user_id_to_index[user_id]
-        item_user_matrix = self.user_item_matrix.T.tocsr()
+def blend_factors(
+    base_model: AlternatingLeastSquares,
+    new_model: AlternatingLeastSquares,
+    old_user_count: int,
+    old_item_count: int,
+) -> None:
 
-        ids, scores = self.model.recommend(
-            userid=user_idx,
-            user_items=item_user_matrix[user_idx],
-            N=k,
-            filter_already_liked_items=True,
-        )
+    new_model.user_factors[:old_user_count, :] = (
+        BLEND_FACTOR * base_model.user_factors[:old_user_count, :]
+        + (1 - BLEND_FACTOR) * new_model.user_factors[:old_user_count, :]
+    )
 
-        return [(self.index_to_item_id[item_idx], float(score)) for item_idx, score in zip(ids, scores)]
+    new_model.item_factors[:old_item_count, :] = (
+        BLEND_FACTOR * base_model.item_factors[:old_item_count, :]
+        + (1 - BLEND_FACTOR) * new_model.item_factors[:old_item_count, :]
+    )
 
-    def evaluate(
-        self,
-        csv_path: str,
-        k: int = 10,
-    ) -> Dict[str, float]:
-        if self.model is None:
-            if os.path.exists(self.output_model_path):
-                with open(self.output_model_path, 'rb') as f:
-                    data = pickle.load(f)
-                self.model = data['model']
-                self.user_id_to_index = data['user_id_to_index']
-                self.item_id_to_index = data['item_id_to_index']
-                self.index_to_user_id = data['index_to_user_id']
-                self.index_to_item_id = data['index_to_item_id']
-            else:
-                return {'precision': 0.0, 'recall': 0.0, 'ndcg': 0.0, 'error': 'No model loaded'}
 
-        try:
-            test_data = self._read_csv_data(csv_path)
-        except Exception as e:
-            return {'precision': 0.0, 'recall': 0.0, 'ndcg': 0.0, 'error': f'Failed to read CSV: {str(e)}'}
+# ======================================================
+# STEP 6: SAVE CANDIDATE MODEL
+# ======================================================
 
-        positive_test = test_data[test_data['interaction_type'].isin(
-            self.POSITIVE_INTERACTION_TYPES)]
+def save_candidate_model(
+    model: AlternatingLeastSquares,
+    user_id_to_index: Dict[int, int],
+    item_id_to_index: Dict[int, int],
+    index_to_user_id: Dict[int, int],
+    index_to_item_id: Dict[int, int],
+    output_path: str,
+) -> None:
 
-        user_test_items: Dict[int, set] = defaultdict(set)
-        for _, row in positive_test.iterrows():
-            user_id = int(row['user_id'])
-            item_id = int(row['job_id'])
-            if user_id in self.user_id_to_index and item_id in self.item_id_to_index:
-                user_test_items[user_id].add(item_id)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        if not user_test_items:
-            return {
-                'precision': 0.0,
-                'recall': 0.0,
-                'ndcg': 0.0,
-                'error': 'No valid test interactions found',
-            }
+    payload = {
+        "model": model,
+        "user_id_to_index": user_id_to_index,
+        "item_id_to_index": item_id_to_index,
+        "index_to_user_id": index_to_user_id,
+        "index_to_item_id": index_to_item_id,
+        "meta": {
+            "retrained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "incremental_iterations": INCREMENTAL_ITERATIONS,
+            "blend_factor": BLEND_FACTOR,
+            "event_weights": EVENT_WEIGHTS,
+        },
+    }
 
-        if self.user_item_matrix is None:
-            n_users = len(self.user_id_to_index)
-            n_items = len(self.item_id_to_index)
-            self.user_item_matrix = csr_matrix(
-                (n_users, n_items), dtype=np.float32)
+    with open(output_path, "wb") as f:
+        pickle.dump(payload, f)
 
-        precisions, recalls, ndcgs = [], [], []
+    print(f"[OK] Candidate model saved to: {output_path}")
 
-        for user_id, true_items in user_test_items.items():
-            if not true_items:
-                continue
 
-            recs = self._recommend(user_id, k=k)
-            if not recs:
-                continue
-
-            rec_items = [item_id for item_id, _ in recs]
-
-            hits = len(set(rec_items) & true_items)
-            precision = hits / k if k > 0 else 0.0
-            recall = hits / len(true_items) if len(true_items) > 0 else 0.0
-
-            dcg = sum(
-                (1.0 if item in true_items else 0.0) / np.log2(i + 2)
-                for i, item in enumerate(rec_items)
-            )
-            idcg = sum(1.0 / np.log2(i + 2)
-                       for i in range(min(len(true_items), k)))
-            ndcg = (dcg / idcg) if idcg > 0 else 0.0
-
-            precisions.append(precision)
-            recalls.append(recall)
-            ndcgs.append(ndcg)
-
-        return {
-            'precision': float(np.mean(precisions)) if precisions else 0.0,
-            'recall': float(np.mean(recalls)) if recalls else 0.0,
-            'ndcg': float(np.mean(ndcgs)) if ndcgs else 0.0,
-            'users_evaluated': len(precisions),
-            'k': k,
-        }
-
+# ======================================================
+# MAIN ENTRYPOINT
+# ======================================================
 
 if __name__ == "__main__":
-    service = RetrainService(
-        base_model_path='CFModel/models/cf_model.pkl',
-        output_model_path='CFModel/models/retrain_cf_model.pkl',
+    print("[START] Load base model")
+    base_data = load_base_model(BASE_MODEL_PATH)
+
+    base_model = base_data["model"]
+    user_id_to_index = dict(base_data["user_id_to_index"])
+    item_id_to_index = dict(base_data["item_id_to_index"])
+    index_to_user_id = dict(base_data["index_to_user_id"])
+    index_to_item_id = dict(base_data["index_to_item_id"])
+
+    old_user_count = len(user_id_to_index)
+    old_item_count = len(item_id_to_index)
+
+    print("[START] Load incremental CSV")
+    df_incremental = load_incremental_data(INCREMENTAL_CSV_PATH)
+
+    print("[START] Build incremental matrix")
+    (
+        incremental_matrix,
+        user_id_to_index,
+        item_id_to_index,
+        index_to_user_id,
+        index_to_item_id,
+    ) = build_incremental_matrix(
+        df_incremental,
+        user_id_to_index,
+        item_id_to_index,
+        index_to_user_id,
+        index_to_item_id,
     )
+
+    print("[START] Retrain ALS model")
+    new_model = retrain_model(base_model, incremental_matrix)
+
+    print("[START] Blend latent factors")
+    blend_factors(
+        base_model,
+        new_model,
+        old_user_count,
+        old_item_count,
+    )
+
+    print("[START] Save candidate model")
+    save_candidate_model(
+        new_model,
+        user_id_to_index,
+        item_id_to_index,
+        index_to_user_id,
+        index_to_item_id,
+        CANDIDATE_MODEL_PATH,
+    )
+
+    print("[DONE] Incremental retrain completed")
