@@ -296,8 +296,8 @@ class RecommendationService:
         ranked_results: List[Dict[str, Any]] = []
         
         # Balanced weights: 
-        cf_weight = 0.6
-        content_weight = 0.4
+        cf_weight = 0.58
+        content_weight = 0.42
         
         logger.info(
             f"Ranking for user {user_id}: balanced weights - "
