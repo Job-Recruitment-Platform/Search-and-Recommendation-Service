@@ -295,9 +295,9 @@ class RecommendationService:
         seen_job_ids = self._collect_seen_job_ids(user_interactions)
         ranked_results: List[Dict[str, Any]] = []
         
-        # Balanced weights: 50/50 CF and Content
-        cf_weight = 0.5
-        content_weight = 0.5
+        # Balanced weights: 
+        cf_weight = 0.6
+        content_weight = 0.4
         
         logger.info(
             f"Ranking for user {user_id}: balanced weights - "
@@ -606,7 +606,7 @@ class RecommendationService:
         self,
         user_id: int,
         user_interactions: Dict[str, Any],
-        cache_ttl: int = 14400
+        cache_ttl: int = 86400  # 1 day
     ) -> List[float]:
         """Calculate short-term user vector from recent interactions.
 
